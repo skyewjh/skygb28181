@@ -78,6 +78,75 @@ def find_local_ip(dst: str) -> str:
         sock.close()
 
 
+_RTSP_URL_RE = re.compile(r"^rtsp://([^/:]+)(?::(\d+))?", re.IGNORECASE)
+
+
+def _parse_rtsp_url(url: str) -> Tuple[str, int]:
+    """Extract ``(host, port)`` from an *rtsp://* URL. Defaults to port 554."""
+    m = _RTSP_URL_RE.match(url)
+    if not m:
+        raise ValueError(f"Not a valid RTSP URL: {url}")
+    host = m.group(1)
+    port = int(m.group(2)) if m.group(2) else 554
+    return host, port
+
+
+def _tcp_probe(host: str, port: int, timeout: float) -> bool:
+    """Return True if a TCP connection to ``host:port`` succeeds within *timeout*."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except (socket.timeout, OSError):
+        return False
+
+
+def check_rtsp_source(source: str, timeout: int = 5) -> bool:
+    """Probe whether *source* is reachable and decodable.
+
+    Strategy:
+      1. If *source* is a non-RTSP URL (e.g. ``"test"``, ``file://``, local
+         pipeline test source) the function returns True — there is nothing
+         useful we can probe in advance.
+      2. Try a lightweight ``gst-launch-1.0`` probe pipeline that decodes
+         a single frame.  This catches authentication errors, codec
+         mismatches, and stream-not-found errors in one shot.
+      3. Fall back to a plain TCP connect if ``gst-launch-1.0`` is missing
+         from the system — this only proves the server is reachable, not
+         that the stream is valid.
+
+    Returns True if the stream looks healthy, False otherwise.
+    """
+    if not source or not source.lower().startswith("rtsp://"):
+        return True  # nothing to probe (test source, file://, etc.)
+
+    host, port = _parse_rtsp_url(source)
+
+    # Strategy 2: gst-launch probe pipeline (decodes one frame)
+    gst_pipeline = (
+        f"gst-launch-1.0 -e rtspsrc location={shlex.quote(source)} "
+        f"num-buffers=1 timeout={int(max(1, timeout)) * 1000000} ! "
+        f"fakesink"
+    )
+    try:
+        result = subprocess.run(
+            gst_pipeline,
+            shell=True,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+            timeout=timeout + 2,  # a little slack over the gst-level timeout
+        )
+        if result.returncode == 0:
+            return True
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        # gst-launch missing or hung — fall through to TCP probe
+        pass
+    except Exception:
+        pass
+
+    # Strategy 3: TCP fallback (network reachability only)
+    return _tcp_probe(host, port, timeout=float(timeout))
+
+
 def load_config(config_path: str) -> Dict[str, Any]:
     """Load configuration from JSON file"""
     if not os.path.exists(config_path):
@@ -98,7 +167,9 @@ def load_config(config_path: str) -> Dict[str, Any]:
         "connection_timeout": 10,
         "source": "test",
         "manufacturer": "StrawberryInno",
-        "devicename": "Superdock"
+        "devicename": "Superdock",
+        "rtsp_precheck": True,
+        "rtsp_precheck_timeout": 5,
     }
     
     # Merge config with defaults
@@ -171,7 +242,9 @@ class GB28181Pusher(AbstractContextManager):
         connection_timeout: int = 10,
         manufacturer: str = "StrawberryInno",
         devicename: str = "Superdock",
-        instance_name: str = "default"
+        instance_name: str = "default",
+        rtsp_precheck: bool = True,
+        rtsp_precheck_timeout: int = 5,
     ) -> None:
         self.server_ip: str = server_ip
         self.server_port: int = server_port
@@ -190,6 +263,8 @@ class GB28181Pusher(AbstractContextManager):
         self.reconnect_interval: int = reconnect_interval
         self.max_reconnect_attempts: int = max_reconnect_attempts
         self.connection_timeout: int = connection_timeout
+        self.rtsp_precheck: bool = rtsp_precheck
+        self.rtsp_precheck_timeout: int = rtsp_precheck_timeout
 
         # 为每个实例创建独立的logger
         self.logger = logging.getLogger(f"gb28181.{instance_name}")
@@ -246,9 +321,40 @@ class GB28181Pusher(AbstractContextManager):
 
     def _connect_and_register(self) -> None:
         """Connect to server and complete registration process."""
+        self._precheck_rtsp()
         self._open_signalling_socket()
         self._register()
         self._start_heartbeat()
+
+    def _precheck_rtsp(self) -> None:
+        """Verify the RTSP source is reachable before opening the SIP socket.
+
+        Skipped when the source is not an ``rtsp://`` URL (e.g. ``"test"``) or
+        when the user has disabled the precheck via ``rtsp_precheck=False``.
+        Raises :class:`RuntimeError` on failure so the surrounding
+        :meth:`run_forever` loop can apply its existing reconnect / backoff
+        policy.
+        """
+        if not self.rtsp_precheck:
+            self.logger.info("RTSP precheck disabled by config — skipping.")
+            return
+        if not self.source or not self.source.lower().startswith("rtsp://"):
+            self.logger.debug("Source is not an RTSP URL — precheck not applicable.")
+            return
+
+        self.logger.info("Pre-checking RTSP source: %s (timeout=%ds) …",
+                         self.source, self.rtsp_precheck_timeout)
+        if check_rtsp_source(self.source, timeout=self.rtsp_precheck_timeout):
+            self.logger.info("RTSP source OK.")
+            return
+
+        msg = (
+            f"RTSP source unreachable or undecodable: {self.source} "
+            f"(timeout={self.rtsp_precheck_timeout}s). "
+            "Aborting connection attempt."
+        )
+        self.logger.error(msg)
+        raise RuntimeError(msg)
 
     def __enter__(self):
         self.run_forever()
@@ -813,7 +919,9 @@ class MultiPusherManager:
                 connection_timeout=config["connection_timeout"],
                 manufacturer=config["manufacturer"],
                 devicename=config["devicename"],
-                instance_name=instance_name
+                instance_name=instance_name,
+                rtsp_precheck=config["rtsp_precheck"],
+                rtsp_precheck_timeout=config["rtsp_precheck_timeout"],
             )
             
             self.pushers.append(pusher)
