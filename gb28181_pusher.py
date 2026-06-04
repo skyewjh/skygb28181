@@ -43,6 +43,7 @@ os.environ['GST_PLUGIN_PATH'] = '/home/lyra/sbgb28181/gst-gb28181sink/build'
 
 import argparse
 import hashlib
+import http.server
 import logging
 import random
 import re
@@ -1190,10 +1191,252 @@ class MultiPusherManager:
 
 
 ###############################################################################
+# ──────────────────────────────── Web Admin UI ──────────────────────────────── #
+###############################################################################
+
+_WEB_INDEX_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>sbgb28181 Admin</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  body { margin: 0; font: 14px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif;
+         background: #0e1419; color: #d6dde3; }
+  header { padding: 14px 20px; background: #131c25; border-bottom: 1px solid #1f2a36;
+           display: flex; align-items: center; gap: 16px; }
+  header h1 { font-size: 18px; margin: 0; color: #7ed1ff; }
+  header .stats { color: #8a99ad; font-size: 13px; }
+  header .stats b { color: #d6dde3; }
+  .actions { margin-left: auto; display: flex; gap: 8px; }
+  button { background: #1d2a38; color: #d6dde3; border: 1px solid #2a3a4d;
+           padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+  button:hover { background: #243446; }
+  button.primary { background: #1f4f7a; border-color: #2974ad; }
+  button.primary:hover { background: #255d8e; }
+  button.danger { background: #5a1f1f; border-color: #8a2929; }
+  button.danger:hover { background: #6b2424; }
+  main { padding: 16px 20px; }
+  .empty { text-align: center; padding: 60px; color: #6a7886; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .card { background: #131c25; border: 1px solid #1f2a36; border-radius: 6px;
+          padding: 12px 14px; }
+  .card .row { display: flex; justify-content: space-between; align-items: center;
+               margin-bottom: 6px; }
+  .card .name { font-weight: 600; color: #e0e6ed; }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+           font-size: 11px; font-weight: 600; text-transform: uppercase; }
+  .badge.ok { background: #0f3d24; color: #6ee79c; }
+  .badge.warn { background: #4a3a0e; color: #f0c060; }
+  .badge.err { background: #4a1010; color: #f08080; }
+  .meta { color: #8a99ad; font-size: 12px; }
+  .meta div { margin: 2px 0; word-break: break-all; }
+  .meta b { color: #aab4c1; font-weight: 500; }
+  .card .row.actions-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid #1f2a36; }
+  .toast { position: fixed; bottom: 16px; right: 16px; background: #1d2a38;
+           border: 1px solid #2a3a4d; padding: 10px 16px; border-radius: 4px;
+           opacity: 0; transition: opacity .3s; }
+  .toast.show { opacity: 1; }
+  .toast.err { border-color: #8a2929; }
+  code { background: #0a0f15; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>sbgb28181 Admin</h1>
+  <div class="stats" id="stats">loading…</div>
+  <div class="actions">
+    <button class="primary" onclick="reloadAll()">↻ Reload Config</button>
+  </div>
+</header>
+<main>
+  <div id="container"><div class="empty">Loading…</div></div>
+</main>
+<div class="toast" id="toast"></div>
+<script>
+let instances = [];
+
+async function fetchStatus() {
+  const r = await fetch('/api/status');
+  instances = await r.json();
+  render();
+}
+
+function render() {
+  const total = instances.length;
+  const ok = instances.filter(i => i.registered && i.thread_alive).length;
+  const bad = total - ok;
+  document.getElementById('stats').innerHTML =
+    `<b>${total}</b> instances · <b style="color:#6ee79c">${ok}</b> registered · ` +
+    `<b style="color:${bad ? '#f08080' : '#8a99ad'}">${bad}</b> unhealthy · ` +
+    `auto-refresh 5s`;
+
+  const c = document.getElementById('container');
+  if (!total) { c.innerHTML = '<div class="empty">No instances running.</div>'; return; }
+  c.className = 'grid';
+  c.innerHTML = instances.map(i => {
+    const state = !i.thread_alive ? 'err'
+                : i.registered ? 'ok' : 'warn';
+    const stateText = !i.thread_alive ? 'dead'
+                    : i.registered ? 'registered' : 'unregistered';
+    return `
+      <div class="card">
+        <div class="row">
+          <div class="name">${esc(i.instance_name)}</div>
+          <span class="badge ${state}">${stateText}</span>
+        </div>
+        <div class="meta">
+          <div><b>channel_id</b> <code>${esc(i.channel_id)}</code></div>
+          <div><b>server</b> ${esc(i.server_ip)} (id ${esc(i.server_id)})</div>
+          <div><b>agent_id</b> <code>${esc(i.agent_id)}</code></div>
+          <div><b>source</b> <code>${esc(i.source)}</code></div>
+          <div><b>thread</b> ${i.thread_alive ? 'alive' : 'dead'}</div>
+        </div>
+        <div class="row actions-row">
+          <button onclick="restart('${esc(i.channel_id)}')">↻ Restart</button>
+        </div>
+      </div>`;
+  }).join('');
+}
+
+function esc(s) { return String(s ?? '').replace(/[&<>"']/g, c =>
+  ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'})[c]); }
+
+function toast(msg, err) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.className = 'toast show' + (err ? ' err' : '');
+  setTimeout(() => t.className = 'toast', 2500);
+}
+
+async function reloadAll() {
+  const r = await fetch('/api/reload', {method: 'POST'});
+  const j = await r.json();
+  toast(`Reload: +${j.added.length} ~${j.updated.length} -${j.removed.length}` +
+        (j.errors.length ? ` (${j.errors.length} errors)` : ''), j.errors.length);
+  fetchStatus();
+}
+
+async function restart(channelId) {
+  if (!confirm(`Restart instance ${channelId}?`)) return;
+  const r = await fetch('/api/restart/' + encodeURIComponent(channelId), {method: 'POST'});
+  const j = await r.json();
+  toast(j.ok ? 'Restarted' : 'Failed: ' + (j.error || 'unknown'), !j.ok);
+  fetchStatus();
+}
+
+fetchStatus();
+setInterval(fetchStatus, 5000);
+</script>
+</body>
+</html>
+"""
+
+
+class _WebHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal JSON API + embedded HTML for the admin UI."""
+
+    manager: "MultiPusherManager" = None  # injected before serve_forever()
+
+    # Silence the default per-request access log — we already log to LOGGER.
+    def log_message(self, format, *args):  # noqa: A002
+        return
+
+    def _send_json(self, payload: Any, status: int = 200) -> None:
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _send_html(self, html: str) -> None:
+        body = html.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if path in ("/", "/index.html"):
+            self._send_html(_WEB_INDEX_HTML)
+        elif path == "/api/status":
+            try:
+                self._send_json(self.manager.get_status())
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+        else:
+            self.send_error(404, "Not Found")
+
+    def do_POST(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if path == "/api/reload":
+            try:
+                summary = self.manager.reload()
+                self._send_json(summary)
+            except Exception as e:
+                self._send_json({"added": [], "updated": [], "removed": [],
+                                 "errors": [str(e)]}, 500)
+        elif path.startswith("/api/restart/"):
+            cid = path[len("/api/restart/"):]
+            if not cid:
+                self._send_json({"ok": False, "error": "missing channel_id"}, 400)
+                return
+            try:
+                ok = self.manager.restart_instance(cid)
+                if ok:
+                    self._send_json({"ok": True})
+                else:
+                    self._send_json({"ok": False, "error": "channel_id not found"}, 404)
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, 500)
+        else:
+            self.send_error(404, "Not Found")
+
+
+class WebAdminServer:
+    """Thin wrapper around ``http.server.ThreadingHTTPServer``."""
+
+    def __init__(self, manager: "MultiPusherManager", host: str, port: int):
+        self.manager = manager
+        self.host = host
+        self.port = port
+        self._server: Optional[http.server.ThreadingHTTPServer] = None
+        self._thread: Optional[threading.Thread] = None
+
+    def start(self) -> None:
+        # Inject the manager reference into the handler class *before* serving.
+        _WebHandler.manager = self.manager
+        self._server = http.server.ThreadingHTTPServer((self.host, self.port), _WebHandler)
+        self._thread = threading.Thread(
+            target=self._server.serve_forever,
+            name="WebAdmin",
+            daemon=True,
+        )
+        self._thread.start()
+        LOGGER.info("Web admin UI available at http://%s:%d/", self.host, self.port)
+
+    def stop(self) -> None:
+        if self._server is not None:
+            self._server.shutdown()
+            self._server.server_close()
+        if self._thread is not None:
+            self._thread.join(timeout=3)
+
+
+###############################################################################
 # ──────────────────────────────── CLI convenience ──────────────────────────────── #
 ###############################################################################
 
-def main(config_dir: str = "config") -> None:
+def main(config_dir: str = "config",
+         web_host: str = "127.0.0.1",
+         web_port: int = 8080,
+         disable_web: bool = False) -> None:
     """Main function - load all configs and run multiple pushers."""
     # Set up SIGHUP handler for config hot-reload (POSIX only).
     reload_requested = threading.Event()
@@ -1224,6 +1467,12 @@ def main(config_dir: str = "config") -> None:
         # 创建多实例管理器
         manager = MultiPusherManager(configs, config_dir=config_dir)
 
+        # 启动 Web 管理界面（如未禁用）
+        web: Optional[WebAdminServer] = None
+        if not disable_web:
+            web = WebAdminServer(manager, host=web_host, port=web_port)
+            web.start()
+
         # 启动所有推流实例
         manager.start_all()
 
@@ -1243,6 +1492,8 @@ def main(config_dir: str = "config") -> None:
         except KeyboardInterrupt:
             LOGGER.info("Received interrupt signal, shutting down all pushers...")
         finally:
+            if web is not None:
+                web.stop()
             manager.shutdown_all()
 
     except Exception as e:
@@ -1265,6 +1516,22 @@ if __name__ == "__main__":
         default="config",
         help="配置文件目录路径 (默认: ./config)"
     )
+    ap.add_argument(
+        "--web-host",
+        default="127.0.0.1",
+        help="Web 管理界面绑定地址 (默认: 127.0.0.1，设为 0.0.0.0 允许外部访问)"
+    )
+    ap.add_argument(
+        "--web-port",
+        type=int,
+        default=8080,
+        help="Web 管理界面端口 (默认: 8080)"
+    )
+    ap.add_argument(
+        "--disable-web",
+        action="store_true",
+        help="禁用 Web 管理界面"
+    )
     args = ap.parse_args()
 
-    main(args.config_dir)
+    main(args.config_dir, args.web_host, args.web_port, args.disable_web)
