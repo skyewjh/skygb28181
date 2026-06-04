@@ -1,21 +1,45 @@
 #!/usr/bin/env python3
-"""gb28181_pusher — GB28181 signaling + test‑stream helper
+"""gb28181_pusher_multi — 支持多路视频的GB28181推流器
 
-Tested on Python 3.9 / Ubuntu 22.04.
+从config文件夹读取多个配置文件，每个配置文件对应一路视频推流
 
-Usage example
-─────────────
+使用方法
+────────────
 
-python3 gb28181_pusher.py \
-    --server-ip 192.168.1.100 --server-port 5060 \
-    --server-id 11009000000000000000 --domain 1100900000 \
-    --agent-id 300000000010000000000 --agent-password 000000 \
-    --channel-id 340000000000000000000 \
-    --source "rtsp://admin:admin@192.168.111.222/h264/ch1/main/av_stream" \
-    --verbose
+python3 gb28181_pusher_multi.py
 
+配置文件目录结构:
+config/
+  ├── camera1.json
+  ├── camera2.json
+  └── camera3.json
+
+每个JSON配置文件格式示例:
+{
+    "server_ip": "192.168.1.100",
+    "server_port": 5060,
+    "server_id": "11009000000000000000",
+    "domain": "1100900000",
+    "agent_id": "300000000010000000001",
+    "agent_password": "000000",
+    "channel_id": "340000000000000000001",
+    "source": "rtsp://admin:admin@192.168.111.222/h264/ch1/main/av_stream",
+    "udp": false,
+    "local_ip": null,
+    "verbose": true,
+    "reconnect_interval": 5,
+    "max_reconnect_attempts": 0,
+    "connection_timeout": 10,
+    "manufacturer": "StrawberryInno",
+    "devicename": "Camera1"
+}
 """
 from __future__ import annotations
+import os
+import glob
+
+# 设置GStreamer插件路径
+os.environ['GST_PLUGIN_PATH'] = '/home/lyra/sbgb28181/gst-gb28181sink/build'
 
 import argparse
 import hashlib
@@ -27,35 +51,95 @@ import socket
 import subprocess
 import threading
 import time
+import json
 from contextlib import AbstractContextManager
-from typing import Callable, List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple, Dict, Any
+from pathlib import Path
+
 
 LOGGER = logging.getLogger("gb28181")
 
-MANUFACTURER = "StrawberryInno"
-DEVICENAME  = "Superdock"
-
 ###############################################################################
-# ───────────────────────────── Helper utilities ───────────────────────────── #
+# ─────────────────────────────── Helper utilities ─────────────────────────────── #
 ###############################################################################
 
 def md5_hex(text: str) -> str:
     """Return ``MD5(text).hexdigest()`` using explicit *UTF‑8* encoding."""
-    return hashlib.md5(text.encode("utf‑8")).hexdigest()
+    return hashlib.md5(text.encode("utf-8")).hexdigest()
 
 
 def find_local_ip(dst: str) -> str:
     """Return the source IPv4 address the kernel would use to reach *dst*."""
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
-        sock.connect((dst, 80))  # arbitrary remote port
+        sock.connect((dst, 80))
         return sock.getsockname()[0]
     finally:
         sock.close()
 
 
+def load_config(config_path: str) -> Dict[str, Any]:
+    """Load configuration from JSON file"""
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file {config_path} not found")
+    
+    with open(config_path, 'r', encoding='utf-8') as f:
+        config = json.load(f)
+    
+    # Set default values for optional parameters
+    defaults = {
+        "server_port": 5060,
+        "domain": None,
+        "udp": False,
+        "local_ip": None,
+        "verbose": False,
+        "reconnect_interval": 5,
+        "max_reconnect_attempts": 0,
+        "connection_timeout": 10,
+        "source": "test",
+        "manufacturer": "StrawberryInno",
+        "devicename": "Superdock"
+    }
+    
+    # Merge config with defaults
+    for key, default_value in defaults.items():
+        if key not in config:
+            config[key] = default_value
+    
+    # Validate required parameters
+    required_params = ["server_ip", "server_id", "agent_id", "agent_password", "channel_id"]
+    missing_params = [param for param in required_params if param not in config]
+    if missing_params:
+        raise ValueError(f"Missing required parameters in {config_path}: {', '.join(missing_params)}")
+    
+    return config
+
+
+def load_all_configs(config_dir: str = "config") -> List[Dict[str, Any]]:
+    """从指定目录加载所有JSON配置文件"""
+    if not os.path.exists(config_dir):
+        raise FileNotFoundError(f"Config directory '{config_dir}' not found")
+    
+    config_files = glob.glob(os.path.join(config_dir, "*.json"))
+    
+    if not config_files:
+        raise FileNotFoundError(f"No JSON config files found in '{config_dir}'")
+    
+    configs = []
+    for config_file in sorted(config_files):
+        try:
+            config = load_config(config_file)
+            config['_config_file'] = os.path.basename(config_file)
+            configs.append(config)
+            LOGGER.info(f"Loaded config: {config_file}")
+        except Exception as e:
+            LOGGER.error(f"Failed to load {config_file}: {e}")
+    
+    return configs
+
+
 ###############################################################################
-# ────────────────────────────── Core class API ────────────────────────────── #
+# ────────────────────────────────── Core class API ────────────────────────────────── #
 ###############################################################################
 
 class GB28181Pusher(AbstractContextManager):
@@ -63,17 +147,11 @@ class GB28181Pusher(AbstractContextManager):
     synthetic test stream (via *gst‑launch‑1.0*) to the requested RTP/PS port.
     """
 
-    # Reasonable protocol defaults — can be overridden at construction time
-    HB_GAP: int = 60      # seconds between keep‑alives
-    REG_TRIES: int = 5    # REGISTER retry attempts
-    RECV_TIMEOUT: int = 5 # UDP rx timeout (seconds)
-
-    # SDP payload type priorities when *m=video* advertises several
+    HB_GAP: int = 60
+    REG_TRIES: int = 5
+    RECV_TIMEOUT: int = 5
     _PT_PRIORITY: Tuple[Tuple[int, str], ...] = ((96, "PS"), (98, "H264"))
 
-    # ---------------------------------------------------------------------
-    # Construction / context‑manager helpers
-    # ---------------------------------------------------------------------
     def __init__(
         self,
         *,
@@ -88,10 +166,12 @@ class GB28181Pusher(AbstractContextManager):
         use_udp_signalling: bool = False,
         local_ip: Optional[str] = None,
         verbose: bool = False,
-        # Reconnection parameters
         reconnect_interval: int = 5,
-        max_reconnect_attempts: int = 0,  # 0 = infinite
+        max_reconnect_attempts: int = 0,
         connection_timeout: int = 10,
+        manufacturer: str = "StrawberryInno",
+        devicename: str = "Superdock",
+        instance_name: str = "default"
     ) -> None:
         self.server_ip: str = server_ip
         self.server_port: int = server_port
@@ -104,56 +184,41 @@ class GB28181Pusher(AbstractContextManager):
         self.use_udp_signalling: bool = use_udp_signalling
         self.local_ip: str = local_ip or find_local_ip(server_ip)
         self.verbose: bool = verbose
-
-        # Reconnection settings
+        self.manufacturer: str = manufacturer
+        self.devicename: str = devicename
+        self.instance_name: str = instance_name
         self.reconnect_interval: int = reconnect_interval
         self.max_reconnect_attempts: int = max_reconnect_attempts
         self.connection_timeout: int = connection_timeout
 
-        log_level = logging.DEBUG if verbose else logging.INFO
-        logging.basicConfig(
-            format="[%(asctime)s] %(levelname)s — %(message)s",
-            datefmt="%H:%M:%S",
-            level=log_level,
-        )
+        # 为每个实例创建独立的logger
+        self.logger = logging.getLogger(f"gb28181.{instance_name}")
 
         self._sock: socket.socket | None = None
         self._send: Callable[[bytes], None]
         self._recv: Callable[[], str]
-
-        # Connection state management
         self._connected: bool = False
         self._shutdown_requested: bool = False
-
-        # Data associated with the current media session
         self._push_thread: Optional[threading.Thread] = None
         self._push_stop_evt: Optional[threading.Event] = None
-
-        # Heartbeat thread management
         self._heartbeat_thread: Optional[threading.Thread] = None
         self._heartbeat_stop_evt: Optional[threading.Event] = None
 
-    # ------------------------------------------------------------
-    # Public top‑level entry point
-    # ------------------------------------------------------------
     def run_forever(self) -> None:
-        """Open signalling socket, REGISTER to the platform, then handle
-        requests forever (``Ctrl‑C`` or :pyclass:`KeyboardInterrupt` to stop).
-        """
+        """Open signalling socket, REGISTER to the platform, then handle requests forever."""
         reconnect_count = 0
 
         while not self._shutdown_requested:
             try:
-                # Attempt to connect and register
                 self._connect_and_register()
                 self._connected = True
-                reconnect_count = 0  # Reset counter on successful connection
+                reconnect_count = 0
 
-                LOGGER.info("Ready — waiting for INVITE/SUBSCRIBE")
+                self.logger.info("Ready — waiting for INVITE/SUBSCRIBE")
                 self._event_loop()
 
             except KeyboardInterrupt:
-                LOGGER.info("Interrupted by user — exiting …")
+                self.logger.info("Interrupted by user — exiting …")
                 break
             except Exception as exc:
                 self._connected = False
@@ -162,16 +227,14 @@ class GB28181Pusher(AbstractContextManager):
                 if self._shutdown_requested:
                     break
 
-                # Check if we should attempt reconnection
                 if self.max_reconnect_attempts > 0 and reconnect_count >= self.max_reconnect_attempts:
-                    LOGGER.error("Max reconnection attempts (%d) reached. Giving up.", self.max_reconnect_attempts)
+                    self.logger.error("Max reconnection attempts (%d) reached. Giving up.", self.max_reconnect_attempts)
                     break
 
                 reconnect_count += 1
-                LOGGER.warning("Connection lost: %s. Attempting reconnection %d in %d seconds...",
+                self.logger.warning("Connection lost: %s. Attempting reconnection %d in %d seconds...",
                              exc, reconnect_count, self.reconnect_interval)
 
-                # Close current socket if exists
                 if self._sock:
                     try:
                         self._sock.close()
@@ -179,27 +242,22 @@ class GB28181Pusher(AbstractContextManager):
                         pass
                     self._sock = None
 
-                # Wait before reconnecting
                 time.sleep(self.reconnect_interval)
 
     def _connect_and_register(self) -> None:
         """Connect to server and complete registration process."""
         self._open_signalling_socket()
-        self._register()  # raises on failure
+        self._register()
         self._start_heartbeat()
 
-    # Context‑manager helpers so callers can ``with GB28181Pusher(...):``
     def __enter__(self):
-        self.run_forever()  # blocks until KeyboardInterrupt / exception
+        self.run_forever()
         return self
 
-    def __exit__(self, exc_type, exc, tb):  # noqa: D401,D401
+    def __exit__(self, exc_type, exc, tb):
         self._shutdown()
-        return False  # do *not* suppress exceptions
+        return False
 
-    # ------------------------------------------------------------------
-    # SIP helpers (REGISTER / MESSAGE / 200 OK / etc.)
-    # ------------------------------------------------------------------
     def _digest_response(
         self,
         nonce: str,
@@ -211,22 +269,19 @@ class GB28181Pusher(AbstractContextManager):
         """Return ``(response, nc, cnonce, qop_used)`` for a *Digest* challenge."""
         a1 = md5_hex(f"{self.agent_id}:{realm}:{self.agent_password}")
         a2 = md5_hex(f"{method}:{uri}")
-        if qop:  # RFC 2617
+        if qop:
             nc = "00000001"
             cnonce = f"{random.randint(0, 0xFFFFFF):06x}"
             resp = md5_hex(f"{a1}:{nonce}:{nc}:{cnonce}:{qop}:{a2}")
             return resp, nc, cnonce, qop
-        # RFC 2069
         resp = md5_hex(f"{a1}:{nonce}:{a2}")
         return resp, None, None, None
 
-    # Sip‑message helper: start‑line • headers[] • body
     @staticmethod
     def _sip(start_line: str, headers: List[str], body: str = "") -> bytes:
         headers.append(f"Content-Length: {len(body)}")
         return (start_line + "\r\n" + "\r\n".join(headers) + "\r\n\r\n" + body).encode()
 
-    # ----- REGISTER helpers -------------------------------------------------
     def _build_register(self, cseq: int, auth_header: Optional[str] = None) -> bytes:
         via_branch = f"z9hG4bK{time.time_ns()}"
         hdrs = [
@@ -244,7 +299,6 @@ class GB28181Pusher(AbstractContextManager):
             hdrs.append(f"Authorization: {auth_header}")
         return self._sip(f"REGISTER sip:{self.domain} SIP/2.0", hdrs)
 
-    # ----- MESSAGE helpers --------------------------------------------------
     def _build_message(self, xml_body: str, cseq: int, suffix: str) -> bytes:
         hdrs = [
             f"Via: SIP/2.0/{'UDP' if self.use_udp_signalling else 'TCP'} {self.local_ip}:{self._local_port};branch=z9hG4bK{time.time_ns()}",
@@ -258,7 +312,6 @@ class GB28181Pusher(AbstractContextManager):
         ]
         return self._sip(f"MESSAGE sip:{self.server_id}@{self.domain} SIP/2.0", hdrs, xml_body)
 
-    # ----- Generic 200 OK for BYE / MESSAGE etc. ----------------------------
     def _ok200(self, req: str) -> bytes:
         via = re.search(r"Via:(.*)", req).group(1).strip()
         fr = re.search(r"From:(.*)", req).group(1).strip()
@@ -276,7 +329,6 @@ class GB28181Pusher(AbstractContextManager):
         ]
         return self._sip("SIP/2.0 200 OK", hdrs)
 
-    # ----- INVITE 200 OK (SDP) ---------------------------------------------
     def _invite_ok(
         self,
         invite_msg: str,
@@ -326,7 +378,6 @@ class GB28181Pusher(AbstractContextManager):
         ]
         return self._sip("SIP/2.0 200 OK", hdrs, sdp_body)
 
-    # ----- SUBSCRIBE 200 OK -------------------------------------------------
     def _sub_ok(self, req: str) -> bytes:
         via = re.search(r"Via:(.*)", req).group(1).strip()
         fr = re.search(r"From:(.*)", req).group(1).strip()
@@ -356,15 +407,12 @@ class GB28181Pusher(AbstractContextManager):
         ]
         return self._sip("SIP/2.0 200 OK", hdrs, body)
 
-    # ------------------------------------------------------------------
-    # Signalling socket helpers
-    # ------------------------------------------------------------------
     def _open_signalling_socket(self) -> None:
         if self.use_udp_signalling:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.bind((self.local_ip, 0))
             sock.settimeout(self.RECV_TIMEOUT)
-            LOGGER.info("UDP signalling %s → %s:%d", sock.getsockname(), self.server_ip, self.server_port)
+            self.logger.info("UDP signalling %s → %s:%d", sock.getsockname(), self.server_ip, self.server_port)
             self._send = self._wrap_send(lambda d: sock.sendto(d, (self.server_ip, self.server_port)), "UDP→")
             self._recv = self._wrap_recv(lambda: sock.recvfrom(65535)[0].decode(), "UDP←")
         else:
@@ -372,7 +420,7 @@ class GB28181Pusher(AbstractContextManager):
             sock.settimeout(self.connection_timeout)
             try:
                 sock.connect((self.server_ip, self.server_port))
-                LOGGER.info("TCP signalling %s → %s:%d", sock.getsockname(), self.server_ip, self.server_port)
+                self.logger.info("TCP signalling %s → %s:%d", sock.getsockname(), self.server_ip, self.server_port)
             except socket.timeout:
                 sock.close()
                 raise ConnectionError(f"Connection timeout after {self.connection_timeout} seconds")
@@ -380,18 +428,16 @@ class GB28181Pusher(AbstractContextManager):
                 sock.close()
                 raise ConnectionError(f"Failed to connect: {e}")
 
-            # Reset timeout for normal operations
             sock.settimeout(None)
             self._send = self._wrap_send(sock.sendall, "TCP→")
             self._recv = self._wrap_recv(lambda: self._recv_tcp(sock), "TCP←")
         self._sock = sock
         self._local_port = sock.getsockname()[1]
 
-    # Send/recv wrappers with optional verbose dump
     def _wrap_send(self, fn: Callable[[bytes], None], label: str) -> Callable[[bytes], None]:
         def _inner(data: bytes):
             if self.verbose:
-                LOGGER.debug("%s\n%s", label, data.decode(errors="ignore"))
+                self.logger.debug("%s\n%s", label, data.decode(errors="ignore"))
             fn(data)
         return _inner
 
@@ -399,13 +445,10 @@ class GB28181Pusher(AbstractContextManager):
         def _inner() -> str:
             data = fn()
             if self.verbose:
-                LOGGER.debug("%s\n%s", label, data)
+                self.logger.debug("%s\n%s", label, data)
             return data
         return _inner
 
-    # ------------------------------------------------------------------
-    # REGISTER / keep‑alive
-    # ------------------------------------------------------------------
     def _register(self) -> None:
         cseq = 1
         for attempt in range(self.REG_TRIES):
@@ -413,7 +456,7 @@ class GB28181Pusher(AbstractContextManager):
             try:
                 rsp = self._recv()
             except socket.timeout:
-                LOGGER.warning("REGISTER timeout (%d/%d)", attempt+1, self.REG_TRIES)
+                self.logger.warning("REGISTER timeout (%d/%d)", attempt+1, self.REG_TRIES)
                 continue
             if rsp.startswith("SIP/2.0 401"):
                 nonce = re.search(r'nonce="([^"]+)"', rsp).group(1)
@@ -424,34 +467,33 @@ class GB28181Pusher(AbstractContextManager):
                 cseq += 1
                 if qop_used:
                     auth_hdr = (
-                        f'Digest username="{self.agent_id}", realm="{realm}", nonce="{nonce}",'  # noqa: E501
+                        f'Digest username="{self.agent_id}", realm="{realm}", nonce="{nonce}",'
                         f' uri="sip:{self.domain}", response="{resp}", algorithm=MD5,'
                         f' qop={qop_used}, nc={nc}, cnonce="{cnonce}"'
                     )
                 else:
                     auth_hdr = (
-                        f'Digest username="{self.agent_id}", realm="{realm}", nonce="{nonce}",'  # noqa: E501
+                        f'Digest username="{self.agent_id}", realm="{realm}", nonce="{nonce}",'
                         f' uri="sip:{self.domain}", response="{resp}", algorithm=MD5'
                     )
                 self._send(self._build_register(cseq, auth_hdr))
                 rsp = self._recv()
             if rsp.startswith("SIP/2.0 200"):
-                LOGGER.info("REGISTER success")
+                self.logger.info("REGISTER success")
                 break
         else:
             raise RuntimeError("Failed to REGISTER after %d attempts" % self.REG_TRIES)
 
-        # --- Send initial INFO / CATALOG / KEEPALIVE --------------------
         info_xml = (
             f"<?xml version='1.0' encoding='GB2312'?><Response>"
             f"<CmdType>DeviceInfo</CmdType><SN>1</SN><DeviceID>{self.agent_id}</DeviceID>"
-            f"<DeviceName>{DEVICENAME}</DeviceName><Manufacturer>{MANUFACTURER}</Manufacturer>"
+            f"<DeviceName>{self.devicename}</DeviceName><Manufacturer>{self.manufacturer}</Manufacturer>"
             f"<Model>test</Model><Firmware>1.0</Firmware><Result>OK</Result></Response>"
         )
         cat_xml = lambda sn: (
             f"<?xml version='1.0' encoding='GB2312'?><Response><CmdType>Catalog</CmdType><SN>{sn}</SN>"
             f"<DeviceID>{self.agent_id}</DeviceID><SumNum>1</SumNum><DeviceList><Item>"
-            f"<DeviceID>{self.channel_id}</DeviceID><Name>ch1</Name><Manufacturer>{MANUFACTURER}</Manufacturer>"
+            f"<DeviceID>{self.channel_id}</DeviceID><Name>ch1</Name><Manufacturer>{self.manufacturer}</Manufacturer>"
             f"<Model>v1</Model><Status>ON</Status></Item></DeviceList></Response>"
         )
         keep_xml = (
@@ -462,13 +504,8 @@ class GB28181Pusher(AbstractContextManager):
         self._send(self._build_message(info_xml, 2, "info"))
         self._send(self._build_message(cat_xml(1), 3, "cat"))
 
-    # ------------------------------------------------------------------
-    # Heart‑beat thread
-    # ------------------------------------------------------------------
     def _start_heartbeat(self):
-        # Stop any existing heartbeat thread
         self._stop_heartbeat()
-
         self._heartbeat_stop_evt = threading.Event()
 
         def _hb():
@@ -479,13 +516,13 @@ class GB28181Pusher(AbstractContextManager):
             )
             while not self._heartbeat_stop_evt.is_set():
                 if self._heartbeat_stop_evt.wait(self.HB_GAP):
-                    break  # Stop event was set
+                    break
                 try:
                     if self._connected and self._send:
                         self._send(self._build_message(keep_xml.format(seq), seq, "k"))
                         seq += 1
                 except Exception as e:
-                    LOGGER.warning("Heartbeat send failed: %s", e)
+                    self.logger.warning("Heartbeat send failed: %s", e)
                     break
 
         self._heartbeat_thread = threading.Thread(target=_hb, daemon=True)
@@ -499,9 +536,6 @@ class GB28181Pusher(AbstractContextManager):
         self._heartbeat_thread = None
         self._heartbeat_stop_evt = None
 
-    # ------------------------------------------------------------------
-    # Main receive loop
-    # ------------------------------------------------------------------
     def _event_loop(self):
         while not self._shutdown_requested and self._connected:
             try:
@@ -509,11 +543,10 @@ class GB28181Pusher(AbstractContextManager):
             except socket.timeout:
                 continue
             except ConnectionError as exc:
-                # Connection-related errors should trigger reconnection
-                LOGGER.error("Connection error in event loop: %s", exc)
+                self.logger.error("Connection error in event loop: %s", exc)
                 raise
             except Exception as exc:
-                LOGGER.exception("Receive error — leaving main loop: %s", exc)
+                self.logger.exception("Receive error — leaving main loop: %s", exc)
                 raise
 
             if pkt.startswith("INVITE"):
@@ -521,15 +554,13 @@ class GB28181Pusher(AbstractContextManager):
             elif pkt.startswith("BYE"):
                 self._send(self._ok200(pkt))
                 self._stop_push()
-                LOGGER.info("Session closed — waiting for next INVITE …")
+                self.logger.info("Session closed — waiting for next INVITE …")
             elif pkt.startswith("MESSAGE"):
                 self._handle_message(pkt)
             elif pkt.startswith("SUBSCRIBE"):
                 self._send(self._sub_ok(pkt))
 
-    # ----- INVITE handling --------------------------------------------------
     def _handle_invite(self, invite_msg: str):
-        # 100 Trying first
         via = re.search(r"Via:(.*)", invite_msg).group(1).strip()
         fr = re.search(r"From:(.*)", invite_msg).group(1).strip()
         to = re.search(r"To:(.*)", invite_msg).group(1).strip()
@@ -540,15 +571,14 @@ class GB28181Pusher(AbstractContextManager):
         try:
             dst_ip, dst_port, pt, is_tcp, ssrc_dec, codec = self._parse_invite(invite_msg)
         except ValueError as exc:
-            LOGGER.warning("Could not parse SDP in INVITE: %s — ignored", exc)
+            self.logger.warning("Could not parse SDP in INVITE: %s — ignored", exc)
             return
 
         self._send(self._invite_ok(invite_msg, dst_ip, dst_port, pt, is_tcp, codec, ssrc_dec))
-        _ = self._recv()  # wait for ACK
+        _ = self._recv()
 
         self._start_push(dst_ip, dst_port, is_tcp, codec, pt, ssrc_dec)
 
-    # ----- MESSAGE handling -------------------------------------------------
     def _handle_message(self, msg: str):
         self._send(self._ok200(msg))
         if "<Query>" in msg:
@@ -558,7 +588,7 @@ class GB28181Pusher(AbstractContextManager):
                 cat_xml = (
                     f"<?xml version='1.0' encoding='GB2312'?><Response><CmdType>Catalog</CmdType>"
                     f"<SN>{sn}</SN><DeviceID>{self.agent_id}</DeviceID><SumNum>1</SumNum><DeviceList><Item>"
-                    f"<DeviceID>{self.channel_id}</DeviceID><Name>ch1</Name><Manufacturer>{MANUFACTURER}</Manufacturer>"
+                    f"<DeviceID>{self.channel_id}</DeviceID><Name>ch1</Name><Manufacturer>{self.manufacturer}</Manufacturer>"
                     f"<Model>v1</Model><Status>ON</Status></Item></DeviceList></Response>"
                 )
                 self._send(self._build_message(cat_xml, 99, "catR"))
@@ -566,14 +596,11 @@ class GB28181Pusher(AbstractContextManager):
                 info_xml = (
                     f"<?xml version='1.0' encoding='GB2312'?><Response>"
                     f"<CmdType>DeviceInfo</CmdType><SN>{sn}</SN><DeviceID>{self.agent_id}</DeviceID>"
-                    f"<DeviceName>{DEVICENAME}</DeviceName><Manufacturer>{MANUFACTURER}</Manufacturer>"
+                    f"<DeviceName>{self.devicename}</DeviceName><Manufacturer>{self.manufacturer}</Manufacturer>"
                     f"<Model>test</Model><Firmware>1.0</Firmware><Result>OK</Result></Response>"
                 )
                 self._send(self._build_message(info_xml, 98, "infoR"))
 
-    # ------------------------------------------------------------------
-    # Media pushing helpers (GStreamer)
-    # ------------------------------------------------------------------
     def _start_push(
         self,
         dst_ip: str,
@@ -583,9 +610,7 @@ class GB28181Pusher(AbstractContextManager):
         pt: int,
         ssrc_dec: Optional[int],
     ) -> None:
-        # stop any previous
         self._stop_push()
-
         self._push_stop_evt = threading.Event()
         self._push_thread = threading.Thread(
             target=self._gst_loop,
@@ -605,7 +630,7 @@ class GB28181Pusher(AbstractContextManager):
             stop_evt: threading.Event
         ) -> None:
         gst_cmd = self._make_gst_cmd(dst_ip, dst_port, use_tcp, codec, pt, ssrc_dec)
-        LOGGER.info("GStreamer cmd: %s", shlex.join(gst_cmd))
+        self.logger.info("GStreamer cmd: %s", shlex.join(gst_cmd))
         proc = subprocess.Popen(gst_cmd)
         try:
             while not stop_evt.is_set():
@@ -613,20 +638,17 @@ class GB28181Pusher(AbstractContextManager):
         finally:
             proc.terminate()
             proc.wait()
-            LOGGER.info("GStreamer exited")
+            self.logger.info("GStreamer exited")
 
-    # Build src part based on self.source
     def _source_elements(self) -> List[str]:
         uri = self.source
         if uri == "test":
             return ["videotestsrc", "is-live=true",
                     "!", "video/x-raw,width=640,height=480,framerate=25/1",
                     "!", "x264enc", "key-int-max=50", "tune=zerolatency", "bitrate=500"]
-            # return ["videotestsrc", "is-live=true"]
         if uri.startswith("rtsp://"):
             return ["rtspsrc", f"location={uri}", "latency=0", "!", "rtph264depay"]
         if uri.startswith("udp://"):
-            # udp://192.168.111.222:5000 or udp://:5000
             loc = uri[6:]
             host, _, port = loc.partition(":")
             elements = ["udpsrc", f"port={port}"]
@@ -655,12 +677,12 @@ class GB28181Pusher(AbstractContextManager):
         ssrc_opt: List[str] = [] if ssrc_dec is None else [f"ssrc=0x{ssrc_dec:08x}"]
         src_chain = self._source_elements()
 
-        if codec == "PS":  # mux to PS
+        if codec == "PS":
             pay_chain = [
                 "!", "h264parse", "!", "mpegpsmux",
                 "!", "gb28181sink", f"protocol={protocol}", f"host={dst_ip}", f"port={dst_port}", f"pt={pt}", *ssrc_opt,
             ]
-        else:  # elementary H.264 -> RTP
+        else:
             pay_chain = [
                 "!", "videoconvert", "!", "x264enc", "key-int-max=50", "tune=zerolatency", "bitrate=800",
                 "!", "rtph264pay", "config-interval=-1", f"pt={pt}",
@@ -675,19 +697,15 @@ class GB28181Pusher(AbstractContextManager):
             self._push_thread = None
             self._push_stop_evt = None
 
-    # ------------------------------------------------------------------
-    # SIP RX helpers: TCP framing & SDP parsing
-    # ------------------------------------------------------------------
     @staticmethod
     def _recv_tcp(sock: socket.socket) -> str:
         """Read exactly one SIP message from *sock* (TCP-framed with CRLFCRLF)."""
         buf = b""
-        # 1) read until blank line marks end of header
         while True:
             if b"\r\n\r\n" in buf:
                 hdr_bin, rest = buf.split(b"\r\n\r\n", 1)
                 break
-            if b"\n\n" in buf:  # some platforms send LF‑only
+            if b"\n\n" in buf:
                 hdr_bin, rest = buf.split(b"\n\n", 1)
                 break
             chunk = sock.recv(8192)
@@ -696,7 +714,6 @@ class GB28181Pusher(AbstractContextManager):
             buf += chunk
         hdr = hdr_bin.decode(errors="ignore")
 
-        # 2) read body per Content‑Length
         m = re.search(r"Content-Length\s*:\s*(\d+)", hdr, re.I)
         need = int(m.group(1)) if m else 0
         body = rest
@@ -706,12 +723,10 @@ class GB28181Pusher(AbstractContextManager):
                 raise ConnectionError("TCP closed before body complete")
             body += chunk
 
-        # 3) return header + CRLFCRLF + body (consistent delimiter)
         return hdr + "\r\n\r\n" + body[:need].decode(errors="ignore")
 
     def _parse_invite(self, msg: str) -> Tuple[str, int, int, bool, Optional[int], str]:
         """Return (*dst_ip*, *dst_port*, *pt*, *is_tcp*, *ssrc*, *codec*)."""
-        # split SDP body
         if "\r\n\r\n" in msg:
             body = msg.split("\r\n\r\n", 1)[1]
         elif "\n\n" in msg:
@@ -747,17 +762,12 @@ class GB28181Pusher(AbstractContextManager):
         if not cand_list:
             raise ValueError("m=video line not found")
 
-        # choose payload type based on preference list
         for want_pt, want_codec in self._PT_PRIORITY:
             if want_pt in cand_list and pt_map.get(want_pt) == want_codec:
                 return dst_ip, dst_port, want_pt, is_tcp, ssrc_dec, want_codec
-        # fallback to first announced
         pt = cand_list[0]
         return dst_ip, dst_port, pt, is_tcp, ssrc_dec, pt_map.get(pt, "H264")
 
-    # ------------------------------------------------------------------
-    # House‑keeping
-    # ------------------------------------------------------------------
     def _shutdown(self):
         self._shutdown_requested = True
         self._connected = False
@@ -766,63 +776,123 @@ class GB28181Pusher(AbstractContextManager):
         if self._sock:
             self._sock.close()
             self._sock = None
-        LOGGER.info("Shutdown complete")
+        self.logger.info("Shutdown complete")
 
 
 ###############################################################################
-# ──────────────────────────── CLI convenience ────────────────────────────── #
+# ──────────────────────────────── Multi-instance Manager ──────────────────────────────── #
 ###############################################################################
 
-def _parse_cli(argv: List[str] | None = None) -> argparse.Namespace:  # noqa: D401
-    ap = argparse.ArgumentParser(description="Minimal GB28181 test‑stream pusher")
-    ap.add_argument("--server-ip", required=True, help="GB28181 platform SIP IP")
-    ap.add_argument("--server-port", type=int, default=5060, help="SIP port [5060]")
-    ap.add_argument("--server-id", required=True, help="Platform device ID (PLAT_ID)")
-    ap.add_argument("--domain", help="Domain (default = first 10 digits of --server-id)")
-    ap.add_argument("--agent-id", required=True, help="Our device ID")
-    ap.add_argument("--agent-password", required=True, help="Password for Digest auth")
-    ap.add_argument("--channel-id", required=True, help="Channel ID (camera) to advertise")
-    ap.add_argument("--source", default="test", help="Media source URI (default: videotestsrc)")
-    ap.add_argument("--udp", action="store_true", help="Use UDP for SIP signalling instead of TCP")
-    ap.add_argument("--local-ip", help="Local IP to bind (auto‑detect if omitted)")
-    ap.add_argument("--verbose", action="store_true", help="Dump full SIP packets")
+class MultiPusherManager:
+    """管理多个GB28181推流实例"""
+    
+    def __init__(self, configs: List[Dict[str, Any]]):
+        self.configs = configs
+        self.pushers: List[GB28181Pusher] = []
+        self.threads: List[threading.Thread] = []
+        
+    def start_all(self):
+        """启动所有推流实例"""
+        for i, config in enumerate(self.configs):
+            instance_name = config.get('_config_file', f'instance_{i}')
+            
+            pusher = GB28181Pusher(
+                server_ip=config["server_ip"],
+                server_port=config["server_port"],
+                server_id=config["server_id"],
+                domain=config["domain"],
+                agent_id=config["agent_id"],
+                agent_password=config["agent_password"],
+                channel_id=config["channel_id"],
+                source=config["source"],
+                use_udp_signalling=config["udp"],
+                local_ip=config["local_ip"],
+                verbose=config["verbose"],
+                reconnect_interval=config["reconnect_interval"],
+                max_reconnect_attempts=config["max_reconnect_attempts"],
+                connection_timeout=config["connection_timeout"],
+                manufacturer=config["manufacturer"],
+                devicename=config["devicename"],
+                instance_name=instance_name
+            )
+            
+            self.pushers.append(pusher)
+            
+            # 为每个pusher创建独立线程
+            thread = threading.Thread(
+                target=pusher.run_forever,
+                name=f"Pusher-{instance_name}",
+                daemon=False
+            )
+            self.threads.append(thread)
+            thread.start()
+            
+            LOGGER.info(f"Started pusher instance: {instance_name}")
+            time.sleep(0.5)  # 稍微延迟启动，避免同时连接
+    
+    def wait_all(self):
+        """等待所有线程结束"""
+        try:
+            for thread in self.threads:
+                thread.join()
+        except KeyboardInterrupt:
+            LOGGER.info("Received interrupt signal, shutting down all pushers...")
+            self.shutdown_all()
+    
+    def shutdown_all(self):
+        """关闭所有推流实例"""
+        for pusher in self.pushers:
+            try:
+                pusher._shutdown()
+            except Exception as e:
+                LOGGER.error(f"Error shutting down pusher: {e}")
 
-    # Reconnection options
-    ap.add_argument("--reconnect-interval", type=int, default=5,
-                   help="Seconds to wait between reconnection attempts [5]")
-    ap.add_argument("--max-reconnect-attempts", type=int, default=0,
-                   help="Maximum reconnection attempts (0 = infinite) [0]")
-    ap.add_argument("--connection-timeout", type=int, default=10,
-                   help="Connection timeout in seconds [10]")
 
-    return ap.parse_args(argv)
+###############################################################################
+# ──────────────────────────────── CLI convenience ──────────────────────────────── #
+###############################################################################
 
-
-def main(argv: List[str] | None = None) -> None:  # noqa: D401
-    ns = _parse_cli(argv)
-    pusher = GB28181Pusher(
-        server_ip=ns.server_ip,
-        server_port=ns.server_port,
-        server_id=ns.server_id,
-        domain=ns.domain,
-        agent_id=ns.agent_id,
-        agent_password=ns.agent_password,
-        channel_id=ns.channel_id,
-        source=ns.source,
-        use_udp_signalling=ns.udp,
-        local_ip=ns.local_ip,
-        verbose=ns.verbose,
-        reconnect_interval=ns.reconnect_interval,
-        max_reconnect_attempts=ns.max_reconnect_attempts,
-        connection_timeout=ns.connection_timeout,
-    )
+def main(config_dir: str = "config") -> None:
+    """Main function - load all configs and run multiple pushers"""
     try:
-        pusher.run_forever()
-    except KeyboardInterrupt:
-        LOGGER.info("Interrupted by user — exiting …")
-    finally:
-        pusher._shutdown()
+        # 加载所有配置文件
+        configs = load_all_configs(config_dir)
+        
+        if not configs:
+            LOGGER.error("No valid configuration files found")
+            return
+        
+        LOGGER.info(f"Found {len(configs)} configuration files")
+        
+        # 创建多实例管理器
+        manager = MultiPusherManager(configs)
+        
+        # 启动所有推流实例
+        manager.start_all()
+        
+        # 等待所有线程
+        manager.wait_all()
+        
+    except Exception as e:
+        LOGGER.error(f"Error: {e}")
+        raise
 
 
 if __name__ == "__main__":
-    main()
+    # 配置日志
+    logging.basicConfig(
+        format="[%(asctime)s] [%(name)s] %(levelname)s — %(message)s",
+        datefmt="%H:%M:%S",
+        level=logging.INFO,
+    )
+    
+    # 命令行参数解析
+    ap = argparse.ArgumentParser(description="多路GB28181推流器 - 从config目录读取配置文件")
+    ap.add_argument(
+        "--config-dir",
+        default="/home/lyra/sbgb28181/config",
+        help="配置文件目录路径 (默认: config)"
+    )
+    args = ap.parse_args()
+    
+    main(args.config_dir)
