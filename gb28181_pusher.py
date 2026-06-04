@@ -47,6 +47,7 @@ import logging
 import random
 import re
 import shlex
+import signal
 import socket
 import subprocess
 import threading
@@ -179,24 +180,33 @@ def load_config(config_path: str) -> Dict[str, Any]:
     
     # Validate required parameters
     required_params = ["server_ip", "server_id", "agent_id", "agent_password", "channel_id"]
-    missing_params = [param for param in required_params if param not in config]
+    missing_params = [param for param in required_params if not config.get(param)]
     if missing_params:
         raise ValueError(f"Missing required parameters in {config_path}: {', '.join(missing_params)}")
-    
+
     return config
 
 
-def load_all_configs(config_dir: str = "config") -> List[Dict[str, Any]]:
-    """从指定目录加载所有JSON配置文件"""
+def load_all_configs(config_dir: str = "config") -> Tuple[List[Dict[str, Any]], List[str]]:
+    """从指定目录加载所有JSON配置文件。
+
+    Returns ``(configs, errors)``:
+      * ``configs`` — 成功加载的配置列表（已注入 ``_config_file`` 元字段）
+      * ``errors``  — 每个错误一条简短描述（按发现顺序）
+
+    Raises ``FileNotFoundError`` only when the directory itself is missing
+    or contains no ``*.json`` files.
+    """
     if not os.path.exists(config_dir):
         raise FileNotFoundError(f"Config directory '{config_dir}' not found")
-    
+
     config_files = glob.glob(os.path.join(config_dir, "*.json"))
-    
+
     if not config_files:
         raise FileNotFoundError(f"No JSON config files found in '{config_dir}'")
-    
-    configs = []
+
+    configs: List[Dict[str, Any]] = []
+    errors: List[str] = []
     for config_file in sorted(config_files):
         try:
             config = load_config(config_file)
@@ -204,9 +214,11 @@ def load_all_configs(config_dir: str = "config") -> List[Dict[str, Any]]:
             configs.append(config)
             LOGGER.info(f"Loaded config: {config_file}")
         except Exception as e:
-            LOGGER.error(f"Failed to load {config_file}: {e}")
-    
-    return configs
+            msg = f"Failed to load {os.path.basename(config_file)}: {e}"
+            LOGGER.error(msg)
+            errors.append(msg)
+
+    return configs, errors
 
 
 ###############################################################################
@@ -890,54 +902,104 @@ class GB28181Pusher(AbstractContextManager):
 ###############################################################################
 
 class MultiPusherManager:
-    """管理多个GB28181推流实例"""
-    
-    def __init__(self, configs: List[Dict[str, Any]]):
+    """管理多个GB28181推流实例，支持配置热重载和单实例重启。"""
+
+    # Used to identify a config on disk across reloads.
+    @staticmethod
+    def _config_fingerprint(config: Dict[str, Any]) -> str:
+        """Return a stable hash of the *mutable* config fields.
+
+        ``_config_file`` and other bookkeeping keys are excluded.
+        """
+        keys = ("server_ip", "server_port", "server_id", "domain",
+                "agent_id", "agent_password", "channel_id", "source",
+                "udp", "local_ip", "verbose", "reconnect_interval",
+                "max_reconnect_attempts", "connection_timeout",
+                "manufacturer", "devicename",
+                "rtsp_precheck", "rtsp_precheck_timeout")
+        payload = {k: config.get(k) for k in keys}
+        return json.dumps(payload, sort_keys=True, default=str)
+
+    def __init__(self, configs: List[Dict[str, Any]], config_dir: str = "config"):
         self.configs = configs
+        self._config_dir = config_dir  # used by reload() to re-scan disk
         self.pushers: List[GB28181Pusher] = []
         self.threads: List[threading.Thread] = []
-        
+        # channel_id -> (pusher, thread, fingerprint) — used by reload()
+        self._index: Dict[str, Tuple[GB28181Pusher, threading.Thread, str]] = {}
+        # Lock guarding structural changes (add/remove pusher).
+        self._lock = threading.Lock()
+
+    def _build_pusher(self, config: Dict[str, Any], instance_name: str) -> GB28181Pusher:
+        return GB28181Pusher(
+            server_ip=config["server_ip"],
+            server_port=config["server_port"],
+            server_id=config["server_id"],
+            domain=config["domain"],
+            agent_id=config["agent_id"],
+            agent_password=config["agent_password"],
+            channel_id=config["channel_id"],
+            source=config["source"],
+            use_udp_signalling=config["udp"],
+            local_ip=config["local_ip"],
+            verbose=config["verbose"],
+            reconnect_interval=config["reconnect_interval"],
+            max_reconnect_attempts=config["max_reconnect_attempts"],
+            connection_timeout=config["connection_timeout"],
+            manufacturer=config["manufacturer"],
+            devicename=config["devicename"],
+            instance_name=instance_name,
+            rtsp_precheck=config["rtsp_precheck"],
+            rtsp_precheck_timeout=config["rtsp_precheck_timeout"],
+        )
+
+    @staticmethod
+    def _channel_id_of(config: Dict[str, Any]) -> str:
+        """The stable identity used to track a pusher across reloads."""
+        return str(config.get("channel_id") or config.get("_config_file") or "")
+
+    def _start_one(self, config: Dict[str, Any], instance_name: str) -> Tuple[GB28181Pusher, threading.Thread]:
+        pusher = self._build_pusher(config, instance_name)
+        thread = threading.Thread(
+            target=pusher.run_forever,
+            name=f"Pusher-{instance_name}",
+            daemon=False,
+        )
+        thread.start()
+        return pusher, thread
+
     def start_all(self):
         """启动所有推流实例"""
         for i, config in enumerate(self.configs):
             instance_name = config.get('_config_file', f'instance_{i}')
-            
-            pusher = GB28181Pusher(
-                server_ip=config["server_ip"],
-                server_port=config["server_port"],
-                server_id=config["server_id"],
-                domain=config["domain"],
-                agent_id=config["agent_id"],
-                agent_password=config["agent_password"],
-                channel_id=config["channel_id"],
-                source=config["source"],
-                use_udp_signalling=config["udp"],
-                local_ip=config["local_ip"],
-                verbose=config["verbose"],
-                reconnect_interval=config["reconnect_interval"],
-                max_reconnect_attempts=config["max_reconnect_attempts"],
-                connection_timeout=config["connection_timeout"],
-                manufacturer=config["manufacturer"],
-                devicename=config["devicename"],
-                instance_name=instance_name,
-                rtsp_precheck=config["rtsp_precheck"],
-                rtsp_precheck_timeout=config["rtsp_precheck_timeout"],
-            )
-            
-            self.pushers.append(pusher)
-            
-            # 为每个pusher创建独立线程
-            thread = threading.Thread(
-                target=pusher.run_forever,
-                name=f"Pusher-{instance_name}",
-                daemon=False
-            )
-            self.threads.append(thread)
-            thread.start()
-            
+            try:
+                pusher, thread = self._start_one(config, instance_name)
+            except Exception as e:
+                LOGGER.error(f"Failed to start {instance_name}: {e}")
+                continue
+            with self._lock:
+                self.pushers.append(pusher)
+                self.threads.append(thread)
+                self._index[self._channel_id_of(config)] = (
+                    pusher, thread, self._config_fingerprint(config)
+                )
             LOGGER.info(f"Started pusher instance: {instance_name}")
             time.sleep(0.5)  # 稍微延迟启动，避免同时连接
-    
+
+    def _stop_one(self, pusher: GB28181Pusher, thread: threading.Thread,
+                  join_timeout: float = 5.0) -> None:
+        """Request shutdown on *pusher* and wait up to *join_timeout* seconds."""
+        try:
+            pusher._shutdown()
+        except Exception as e:
+            LOGGER.error(f"Error requesting shutdown for {pusher.instance_name}: {e}")
+        thread.join(timeout=join_timeout)
+        if thread.is_alive():
+            LOGGER.warning(
+                "Pusher thread %s did not exit within %.1fs — leaking (daemon=False).",
+                thread.name, join_timeout,
+            )
+
     def wait_all(self):
         """等待所有线程结束"""
         try:
@@ -946,14 +1008,185 @@ class MultiPusherManager:
         except KeyboardInterrupt:
             LOGGER.info("Received interrupt signal, shutting down all pushers...")
             self.shutdown_all()
-    
+
     def shutdown_all(self):
         """关闭所有推流实例"""
-        for pusher in self.pushers:
-            try:
-                pusher._shutdown()
-            except Exception as e:
-                LOGGER.error(f"Error shutting down pusher: {e}")
+        with self._lock:
+            items = list(self._index.values())
+        for pusher, thread, _fp in items:
+            self._stop_one(pusher, thread)
+        with self._lock:
+            self.pushers.clear()
+            self.threads.clear()
+            self._index.clear()
+
+    # ------------------------------------------------------------------
+    # Hot reload & per-instance control (used by SIGHUP and the web UI)
+    # ------------------------------------------------------------------
+
+    def reload(self) -> Dict[str, Any]:
+        """Diff current config dir against running instances and reconcile.
+
+        Returns a summary dict ``{added, updated, removed, errors}`` for
+        logging and the web API.  Individual config errors do not abort the
+        whole reload — they are reported under ``errors``.
+        """
+        config_dir = self._config_dir or "config"
+        try:
+            new_configs, scan_errors = load_all_configs(config_dir)
+        except Exception as e:
+            LOGGER.error("Reload aborted — cannot scan %s: %s", config_dir, e)
+            return {"added": [], "updated": [], "removed": [], "errors": [str(e)]}
+
+        summary: Dict[str, Any] = {"added": [], "updated": [], "removed": [], "errors": list(scan_errors)}
+
+        # Index new configs by channel_id (preserve insertion order for "added")
+        new_index: Dict[str, Dict[str, Any]] = {}
+        for cfg in new_configs:
+            cid = self._channel_id_of(cfg)
+            if not cid:
+                msg = f"Config {cfg.get('_config_file')} has no channel_id — skipped"
+                LOGGER.error(msg)
+                summary["errors"].append(msg)
+                continue
+            if cid in new_index:
+                msg = f"Duplicate channel_id {cid} — skipping {cfg.get('_config_file')}"
+                LOGGER.error(msg)
+                summary["errors"].append(msg)
+                continue
+            new_index[cid] = cfg
+
+        with self._lock:
+            current = dict(self._index)
+
+        # ---- 1. Remove instances whose config is gone or whose file was deleted
+        for cid, (pusher, thread, _fp) in current.items():
+            if cid not in new_index:
+                self._stop_one(pusher, thread)
+                with self._lock:
+                    self._index.pop(cid, None)
+                    if pusher in self.pushers:
+                        self.pushers.remove(pusher)
+                    if thread in self.threads:
+                        self.threads.remove(thread)
+                LOGGER.info("Reload: removed %s (channel_id=%s)", pusher.instance_name, cid)
+                summary["removed"].append(pusher.instance_name)
+
+        # ---- 2. Add new / update changed
+        for cid, cfg in new_index.items():
+            new_fp = self._config_fingerprint(cfg)
+            instance_name = cfg.get("_config_file", cid)
+            if cid not in current:
+                # Brand new instance
+                try:
+                    pusher, thread = self._start_one(cfg, instance_name)
+                except Exception as e:
+                    msg = f"Failed to start {instance_name}: {e}"
+                    LOGGER.error(msg)
+                    summary["errors"].append(msg)
+                    continue
+                with self._lock:
+                    self.pushers.append(pusher)
+                    self.threads.append(thread)
+                    self._index[cid] = (pusher, thread, new_fp)
+                LOGGER.info("Reload: added %s (channel_id=%s)", instance_name, cid)
+                summary["added"].append(instance_name)
+            else:
+                old_pusher, old_thread, old_fp = current[cid]
+                if old_fp != new_fp:
+                    self._stop_one(old_pusher, old_thread)
+                    try:
+                        pusher, thread = self._start_one(cfg, instance_name)
+                    except Exception as e:
+                        msg = f"Failed to restart {instance_name}: {e}"
+                        LOGGER.error(msg)
+                        summary["errors"].append(msg)
+                        with self._lock:
+                            self._index.pop(cid, None)
+                            if old_pusher in self.pushers:
+                                self.pushers.remove(old_pusher)
+                            if old_thread in self.threads:
+                                self.threads.remove(old_thread)
+                        continue
+                    with self._lock:
+                        self.pushers.remove(old_pusher)
+                        self.threads.remove(old_thread)
+                        self.pushers.append(pusher)
+                        self.threads.append(thread)
+                        self._index[cid] = (pusher, thread, new_fp)
+                    LOGGER.info("Reload: updated %s (channel_id=%s)", instance_name, cid)
+                    summary["updated"].append(instance_name)
+                # else: fingerprint matches, leave running instance alone
+
+        return summary
+
+    def restart_instance(self, channel_id: str) -> bool:
+        """Stop and re-create a single instance.  Returns False if not found."""
+        with self._lock:
+            entry = self._index.get(channel_id)
+        if entry is None:
+            LOGGER.warning("restart_instance: channel_id=%s not found", channel_id)
+            return False
+        pusher, thread, _fp = entry
+        instance_name = pusher.instance_name
+
+        # Find the current config to rebuild from.
+        config = next((c for c in self.configs if self._channel_id_of(c) == channel_id), None)
+        if config is None:
+            # Config was removed from disk — just stop the instance.
+            self._stop_one(pusher, thread)
+            with self._lock:
+                self._index.pop(channel_id, None)
+                if pusher in self.pushers:
+                    self.pushers.remove(pusher)
+                if thread in self.threads:
+                    self.threads.remove(thread)
+            LOGGER.info("restart_instance: removed orphan %s (channel_id=%s)",
+                        instance_name, channel_id)
+            return True
+
+        self._stop_one(pusher, thread)
+        try:
+            new_pusher, new_thread = self._start_one(config, instance_name)
+        except Exception as e:
+            LOGGER.error("restart_instance: failed to start %s: %s", instance_name, e)
+            with self._lock:
+                self._index.pop(channel_id, None)
+                if pusher in self.pushers:
+                    self.pushers.remove(pusher)
+                if thread in self.threads:
+                    self.threads.remove(thread)
+            return False
+        with self._lock:
+            self.pushers.remove(pusher)
+            self.threads.remove(thread)
+            self.pushers.append(new_pusher)
+            self.threads.append(new_thread)
+            self._index[channel_id] = (new_pusher, new_thread, self._config_fingerprint(config))
+        LOGGER.info("restart_instance: restarted %s (channel_id=%s)", instance_name, channel_id)
+        return True
+
+    def get_status(self) -> List[Dict[str, Any]]:
+        """Snapshot of every running pusher for the web UI."""
+        with self._lock:
+            items = list(self._index.items())
+        out = []
+        for cid, (pusher, thread, _fp) in items:
+            uptime = 0.0
+            if thread.is_alive():
+                # threading.Thread has no start_time; we approximate from process.
+                pass
+            out.append({
+                "channel_id": cid,
+                "instance_name": pusher.instance_name,
+                "server_ip": pusher.server_ip,
+                "server_id": pusher.server_id,
+                "agent_id": pusher.agent_id,
+                "source": pusher.source,
+                "registered": bool(getattr(pusher, "_connected", False)),
+                "thread_alive": thread.is_alive(),
+            })
+        return out
 
 
 ###############################################################################
@@ -961,26 +1194,57 @@ class MultiPusherManager:
 ###############################################################################
 
 def main(config_dir: str = "config") -> None:
-    """Main function - load all configs and run multiple pushers"""
+    """Main function - load all configs and run multiple pushers."""
+    # Set up SIGHUP handler for config hot-reload (POSIX only).
+    reload_requested = threading.Event()
+
+    def _sighup_handler(signum, frame):
+        LOGGER.info("SIGHUP received — scheduling config reload")
+        reload_requested.set()
+
+    try:
+        signal.signal(signal.SIGHUP, _sighup_handler)
+    except (AttributeError, ValueError):
+        # signal.SIGHUP doesn't exist on Windows, or we're not in the main thread.
+        LOGGER.warning("SIGHUP not available on this platform — hot reload via SIGHUP disabled")
+
     try:
         # 加载所有配置文件
-        configs = load_all_configs(config_dir)
-        
+        configs, load_errors = load_all_configs(config_dir)
+
         if not configs:
             LOGGER.error("No valid configuration files found")
             return
-        
+
+        for err in load_errors:
+            LOGGER.warning("Skipped invalid config: %s", err)
+
         LOGGER.info(f"Found {len(configs)} configuration files")
-        
+
         # 创建多实例管理器
-        manager = MultiPusherManager(configs)
-        
+        manager = MultiPusherManager(configs, config_dir=config_dir)
+
         # 启动所有推流实例
         manager.start_all()
-        
-        # 等待所有线程
-        manager.wait_all()
-        
+
+        # 主循环：等待 + 处理 SIGHUP 重载 + 优雅退出
+        try:
+            while True:
+                # Periodic reload check (in case SIGHUP wakes us up)
+                if reload_requested.is_set():
+                    reload_requested.clear()
+                    summary = manager.reload()
+                    LOGGER.info("Hot-reload summary: +%d ~%d -%d (errors=%d)",
+                                len(summary["added"]), len(summary["updated"]),
+                                len(summary["removed"]), len(summary["errors"]))
+                # Block on a short sleep so we can be interrupted promptly.
+                # Using Event.wait makes it responsive to SIGHUP without polling.
+                reload_requested.wait(timeout=1.0)
+        except KeyboardInterrupt:
+            LOGGER.info("Received interrupt signal, shutting down all pushers...")
+        finally:
+            manager.shutdown_all()
+
     except Exception as e:
         LOGGER.error(f"Error: {e}")
         raise
@@ -993,14 +1257,14 @@ if __name__ == "__main__":
         datefmt="%H:%M:%S",
         level=logging.INFO,
     )
-    
+
     # 命令行参数解析
     ap = argparse.ArgumentParser(description="多路GB28181推流器 - 从config目录读取配置文件")
     ap.add_argument(
         "--config-dir",
-        default="/home/lyra/sbgb28181/config",
-        help="配置文件目录路径 (默认: config)"
+        default="config",
+        help="配置文件目录路径 (默认: ./config)"
     )
     args = ap.parse_args()
-    
+
     main(args.config_dir)
