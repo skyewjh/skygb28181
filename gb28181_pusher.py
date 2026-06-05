@@ -39,7 +39,7 @@ import os
 import glob
 
 # 设置GStreamer插件路径
-os.environ['GST_PLUGIN_PATH'] = '/home/lyra/sbgb28181/gst-gb28181sink/build'
+os.environ['GST_PLUGIN_PATH'] = './gst-gb28181sink/build'
 
 import argparse
 import hashlib
@@ -57,6 +57,7 @@ import json
 from contextlib import AbstractContextManager
 from typing import Callable, List, Optional, Tuple, Dict, Any
 from pathlib import Path
+from urllib.parse import parse_qs
 
 
 LOGGER = logging.getLogger("gb28181")
@@ -186,6 +187,148 @@ def load_config(config_path: str) -> Dict[str, Any]:
         raise ValueError(f"Missing required parameters in {config_path}: {', '.join(missing_params)}")
 
     return config
+
+
+# ##############################################################################
+# ────────────────────── Web CRUD helper utilities ─────────────────────────────
+# ##############################################################################
+#
+# These functions are used by the embedded web admin to validate, persist and
+# safely resolve channel config file paths.  Keeping them as module-level
+# functions makes them easy to unit-test without spinning up the HTTP server.
+
+# Field names that the web CRUD form accepts and what we expect from each.
+_CRUD_FIELDS: Dict[str, type] = {
+    "server_ip": str,
+    "server_id": str,
+    "agent_id": str,
+    "agent_password": str,
+    "channel_id": str,
+    "source": str,
+}
+
+# Optional fields with type coercion callbacks.  None == str.
+_CRUD_OPTIONAL_FIELDS: Dict[str, Any] = {
+    "server_port": int,
+    "domain": str,
+    "udp": lambda v: _parse_bool(v, default=False),
+    "local_ip": str,
+    "verbose": lambda v: _parse_bool(v, default=False),
+    "reconnect_interval": int,
+    "max_reconnect_attempts": int,
+    "connection_timeout": int,
+    "manufacturer": str,
+    "devicename": str,
+    "rtsp_precheck": lambda v: _parse_bool(v, default=True),
+    "rtsp_precheck_timeout": int,
+}
+
+_CONFIG_FILE_RE = re.compile(r"^[A-Za-z0-9_\-]+\.json$")
+
+
+def _parse_bool(value: Any, default: bool = False) -> bool:
+    """Lenient bool parser used by the web CRUD form.
+
+    Accepts ``"true"`` / ``"false"`` (case-insensitive), ``"1"`` / ``"0"``,
+    ``"yes"`` / ``"no"``.  Falls back to *default* on anything else.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return default
+    s = str(value).strip().lower()
+    if s in ("true", "1", "yes", "y", "on"):
+        return True
+    if s in ("false", "0", "no", "n", "off", ""):
+        return False
+    return default
+
+
+def _build_config_from_form(form: Dict[str, str]) -> Dict[str, Any]:
+    """Coerce a flat ``{field: str_value}`` mapping into a typed config dict.
+
+    The form is the raw ``urllib.parse.parse_qs`` result (or any mapping of
+    string values).  Required fields missing or empty raise :class:`ValueError`;
+    unknown fields are silently dropped.  The returned dict is filled in with
+    the same defaults as :func:`load_config` so that downstream code
+    (``_build_pusher``) can always read every key without ``KeyError``.
+    """
+    out: Dict[str, Any] = {}
+    for key, _typ in _CRUD_FIELDS.items():
+        v = (form.get(key) or "").strip()
+        if not v:
+            raise ValueError(f"Missing required field: {key}")
+        out[key] = v
+
+    for key, caster in _CRUD_OPTIONAL_FIELDS.items():
+        raw = form.get(key)
+        if raw is None or str(raw).strip() == "":
+            # Apply sensible default matching load_config() defaults.
+            out[key] = _CRUD_FIELD_DEFAULTS.get(key)
+            continue
+        try:
+            out[key] = caster(raw) if callable(caster) else caster(raw)
+        except (TypeError, ValueError) as e:
+            raise ValueError(f"Invalid value for {key!r}: {raw!r} ({e})") from None
+
+    # Belt-and-braces: also apply load_config's defaults for any key neither
+    # required nor optional.  Keeps the dict shape identical to what
+    # load_config() would return.
+    for k, v in _CRUD_FIELD_DEFAULTS.items():
+        out.setdefault(k, v)
+    return out
+
+
+# Same defaults used by load_config() — kept in sync.
+_CRUD_FIELD_DEFAULTS: Dict[str, Any] = {
+    "server_port": 5060,
+    "domain": None,
+    "udp": False,
+    "local_ip": None,
+    "verbose": False,
+    "reconnect_interval": 5,
+    "max_reconnect_attempts": 0,
+    "connection_timeout": 10,
+    "source": "test",
+    "manufacturer": "StrawberryInno",
+    "devicename": "Superdock",
+    "rtsp_precheck": True,
+    "rtsp_precheck_timeout": 5,
+}
+
+
+def _safe_config_path(config_dir: str, config_file: str) -> str:
+    """Resolve ``config_dir/config_file`` and reject any path escaping *config_dir*.
+
+    Raises :class:`ValueError` if *config_file* contains ``..``, an absolute
+    path, or anything outside the allowed ``[A-Za-z0-9_-].json`` pattern.
+    """
+    if not config_file or not _CONFIG_FILE_RE.match(config_file):
+        raise ValueError(
+            f"Invalid config_file name: {config_file!r} "
+            "(must match [A-Za-z0-9_-]+\\.json)"
+        )
+    base = os.path.realpath(config_dir)
+    candidate = os.path.realpath(os.path.join(base, config_file))
+    if not candidate.startswith(base + os.sep) and candidate != base:
+        raise ValueError(f"config_file escapes config_dir: {config_file!r}")
+    return candidate
+
+
+def _save_config_atomic(path: str, config: Dict[str, Any]) -> None:
+    """Write *config* to *path* atomically via a sibling ``.tmp`` + ``os.replace``.
+
+    The file is created with mode 0o600 so credentials aren't world-readable.
+    """
+    tmp_path = path + ".tmp"
+    with open(tmp_path, "w", encoding="utf-8") as f:
+        json.dump(config, f, indent=2, ensure_ascii=False)
+        f.flush()
+        os.fchmod(f.fileno(), 0o600)
+    os.replace(tmp_path, path)
+
+
+# ##############################################################################
 
 
 def load_all_configs(config_dir: str = "config") -> Tuple[List[Dict[str, Any]], List[str]]:
@@ -1189,6 +1332,174 @@ class MultiPusherManager:
             })
         return out
 
+    # ----- Web CRUD: add / update / delete a single channel -----------------
+
+    def get_channel(self, channel_id: str) -> Optional[Dict[str, Any]]:
+        """Return ``{channel_id, config_file, config}`` for *channel_id* or ``None``.
+
+        *config* is the full on-disk dict with the internal ``_config_file`` key
+        included so the web UI can show / preserve the file name on round-trip.
+        """
+        with self._lock:
+            entry = self._index.get(channel_id)
+        # Prefer the _config_file recorded in self.configs (more reliable than
+        # the instance name, which has the ".json" stripped).
+        config = None
+        config_file = None
+        for c in self.configs:
+            if self._channel_id_of(c) == channel_id:
+                config = dict(c)
+                config_file = c.get("_config_file") or (f"{entry[0].instance_name}.json" if entry else None)
+                break
+        if config is None and entry is not None:
+            # Orphaned instance whose config was deleted from disk — fall back
+            # to the live instance's instance_name and try the file directly.
+            config_file = f"{entry[0].instance_name}.json"
+            path = _safe_config_path(self._config_dir, config_file)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    config = json.load(f)
+                    config["_config_file"] = config_file
+        if config is None:
+            return None
+        return {"channel_id": channel_id, "config_file": config_file, "config": config}
+
+    def add_channel(self, config: Dict[str, Any], config_file: str) -> Dict[str, Any]:
+        """Create a new channel: write the JSON file then start a pusher.
+
+        *config* is the typed config dict (from :func:`_build_config_from_form`).
+        *config_file* is the desired filename inside ``self._config_dir``.
+
+        Returns a summary dict ``{channel_id, config_file, started}``.  Raises
+        :class:`FileExistsError` if *config_file* already exists, and
+        :class:`ValueError` on validation failures.
+        """
+        if not self._config_dir:
+            raise ValueError("config_dir is not set")
+        path = _safe_config_path(self._config_dir, config_file)
+        if os.path.exists(path):
+            raise FileExistsError(f"config_file already exists: {config_file}")
+        # Inject _config_file so reload() / start_all() pick it up correctly.
+        config_with_meta = dict(config)
+        config_with_meta["_config_file"] = config_file
+        _save_config_atomic(path, config_with_meta)
+        instance_name = config_file[:-len(".json")]
+        try:
+            pusher, thread = self._start_one(config_with_meta, instance_name)
+        except Exception as e:
+            # Roll back the file so the disk and live state don't diverge.
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            raise
+        with self._lock:
+            self.configs.append(config_with_meta)
+            self.pushers.append(pusher)
+            self.threads.append(thread)
+            self._index[self._channel_id_of(config_with_meta)] = (
+                pusher, thread, self._config_fingerprint(config_with_meta)
+            )
+        LOGGER.info("add_channel: created %s (channel_id=%s)",
+                    instance_name, self._channel_id_of(config_with_meta))
+        return {
+            "channel_id": self._channel_id_of(config_with_meta),
+            "config_file": config_file,
+            "started": True,
+        }
+
+    def update_channel(self, channel_id: str, config: Dict[str, Any]) -> Dict[str, Any]:
+        """Replace the config of an existing channel and restart it.
+
+        The new *config* is written to the same file the original was loaded
+        from (looked up via the running instance's ``instance_name``), and the
+        instance is stopped and re-created.  Returns
+        ``{channel_id, config_file, updated, restarted}``.
+        """
+        with self._lock:
+            entry = self._index.get(channel_id)
+        if entry is None:
+            raise KeyError(f"channel_id not found: {channel_id}")
+        pusher, thread, _fp = entry
+        instance_name = pusher.instance_name
+        config_file = f"{instance_name}.json"
+        path = _safe_config_path(self._config_dir, config_file)
+        config_with_meta = dict(config)
+        config_with_meta["_config_file"] = config_file
+        _save_config_atomic(path, config_with_meta)
+        # Replace in self.configs (matched by old config_file)
+        with self._lock:
+            for i, c in enumerate(self.configs):
+                if c.get("_config_file") == config_file:
+                    self.configs[i] = config_with_meta
+                    break
+            else:
+                self.configs.append(config_with_meta)
+        self._stop_one(pusher, thread)
+        try:
+            new_pusher, new_thread = self._start_one(config_with_meta, instance_name)
+        except Exception as e:
+            LOGGER.error("update_channel: failed to start %s: %s", instance_name, e)
+            with self._lock:
+                self._index.pop(channel_id, None)
+                if pusher in self.pushers:
+                    self.pushers.remove(pusher)
+                if thread in self.threads:
+                    self.threads.remove(thread)
+            raise
+        with self._lock:
+            self.pushers.remove(pusher)
+            self.threads.remove(thread)
+            self.pushers.append(new_pusher)
+            self.threads.append(new_thread)
+            self._index[channel_id] = (new_pusher, new_thread,
+                                       self._config_fingerprint(config_with_meta))
+        LOGGER.info("update_channel: updated %s (channel_id=%s)", instance_name, channel_id)
+        return {
+            "channel_id": channel_id,
+            "config_file": config_file,
+            "updated": True,
+            "restarted": True,
+        }
+
+    def delete_channel(self, channel_id: str) -> Dict[str, Any]:
+        """Hard-delete a channel: stop the instance and remove its JSON file.
+
+        If the file is already gone (orphaned instance) we still stop the
+        instance and report success.
+        """
+        with self._lock:
+            entry = self._index.get(channel_id)
+        if entry is None:
+            raise KeyError(f"channel_id not found: {channel_id}")
+        pusher, thread, _fp = entry
+        instance_name = pusher.instance_name
+        config_file = f"{instance_name}.json"
+        self._stop_one(pusher, thread)
+        with self._lock:
+            self._index.pop(channel_id, None)
+            if pusher in self.pushers:
+                self.pushers.remove(pusher)
+            if thread in self.threads:
+                self.threads.remove(thread)
+            self.configs = [c for c in self.configs
+                            if c.get("_config_file") != config_file]
+        # Best-effort file removal — don't fail the call if the file is gone.
+        try:
+            path = _safe_config_path(self._config_dir, config_file)
+            if os.path.exists(path):
+                os.remove(path)
+        except ValueError as e:
+            LOGGER.warning("delete_channel: %s", e)
+        except OSError as e:
+            LOGGER.warning("delete_channel: failed to remove %s: %s", config_file, e)
+        LOGGER.info("delete_channel: removed %s (channel_id=%s)", instance_name, channel_id)
+        return {
+            "channel_id": channel_id,
+            "config_file": config_file,
+            "deleted": True,
+        }
+
 
 ###############################################################################
 # ──────────────────────────────── Web Admin UI ──────────────────────────────── #
@@ -1219,12 +1530,12 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
   button.danger:hover { background: #6b2424; }
   main { padding: 16px 20px; }
   .empty { text-align: center; padding: 60px; color: #6a7886; }
-  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(360px, 1fr)); }
   .card { background: #131c25; border: 1px solid #1f2a36; border-radius: 6px;
           padding: 12px 14px; }
   .card .row { display: flex; justify-content: space-between; align-items: center;
                margin-bottom: 6px; }
-  .card .name { font-weight: 600; color: #e0e6ed; }
+  .card .name { font-weight: 600; color: #e0e6ed; word-break: break-all; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
            font-size: 11px; font-weight: 600; text-transform: uppercase; }
   .badge.ok { background: #0f3d24; color: #6ee79c; }
@@ -1233,13 +1544,40 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
   .meta { color: #8a99ad; font-size: 12px; }
   .meta div { margin: 2px 0; word-break: break-all; }
   .meta b { color: #aab4c1; font-weight: 500; }
-  .card .row.actions-row { margin-top: 10px; padding-top: 10px; border-top: 1px solid #1f2a36; }
+  .card .row.actions-row { margin-top: 10px; padding-top: 10px;
+                           border-top: 1px solid #1f2a36; gap: 6px; }
+  .card .row.actions-row button { flex: 1; }
   .toast { position: fixed; bottom: 16px; right: 16px; background: #1d2a38;
            border: 1px solid #2a3a4d; padding: 10px 16px; border-radius: 4px;
-           opacity: 0; transition: opacity .3s; }
+           opacity: 0; transition: opacity .3s; z-index: 100; }
   .toast.show { opacity: 1; }
   .toast.err { border-color: #8a2929; }
   code { background: #0a0f15; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+
+  /* Modal */
+  .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
+              align-items: center; justify-content: center; z-index: 50; }
+  .modal-bg.show { display: flex; }
+  .modal { background: #131c25; border: 1px solid #2a3a4d; border-radius: 8px;
+           padding: 20px; width: 560px; max-width: 95vw; max-height: 90vh;
+           overflow-y: auto; }
+  .modal h2 { margin: 0 0 12px; font-size: 16px; color: #7ed1ff; }
+  .modal .grid-form { display: grid; grid-template-columns: 130px 1fr; gap: 8px 12px;
+                      align-items: center; }
+  .modal .grid-form label { color: #8a99ad; font-size: 12px; text-align: right; }
+  .modal .grid-form input, .modal .grid-form select {
+    background: #0a0f15; border: 1px solid #2a3a4d; color: #d6dde3;
+    padding: 6px 8px; border-radius: 4px; font-size: 13px; width: 100%;
+    font-family: inherit; }
+  .modal .grid-form input:focus { outline: none; border-color: #2974ad; }
+  .modal .row-buttons { display: flex; gap: 8px; justify-content: flex-end;
+                        margin-top: 16px; }
+  .modal .err { color: #f08080; font-size: 12px; margin-top: 8px; min-height: 14px; }
+  .pw-wrap { position: relative; }
+  .pw-wrap .toggle { position: absolute; right: 6px; top: 50%; transform: translateY(-50%);
+                     background: transparent; border: 0; color: #7ed1ff; cursor: pointer;
+                     font-size: 11px; padding: 2px 6px; }
+  .small { color: #6a7886; font-size: 11px; }
 </style>
 </head>
 <body>
@@ -1247,54 +1585,153 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
   <h1>sbgb28181 Admin</h1>
   <div class="stats" id="stats">loading…</div>
   <div class="actions">
-    <button class="primary" onclick="reloadAll()">↻ Reload Config</button>
+    <button class="primary" onclick="openAdd()">+ Add Channel</button>
+    <button onclick="reloadAll()">↻ Reload Config</button>
   </div>
 </header>
 <main>
   <div id="container"><div class="empty">Loading…</div></div>
 </main>
 <div class="toast" id="toast"></div>
+
+<!-- Channel add/edit modal -->
+<div class="modal-bg" id="modal">
+  <div class="modal">
+    <h2 id="modalTitle">Add Channel</h2>
+    <form id="chForm" class="grid-form" onsubmit="return submitForm(event)">
+      <label for="f-config_file">config_file *</label>
+      <input id="f-config_file" name="config_file" required pattern="[A-Za-z0-9_\\-]+\\.json"
+             placeholder="camera_lobby.json">
+      <label></label>
+      <div class="small">File name under <code>config/</code> (one JSON per channel).</div>
+
+      <label for="f-channel_id">channel_id *</label>
+      <input id="f-channel_id" name="channel_id" required
+             placeholder="340000000000000000001">
+
+      <label for="f-server_ip">server_ip *</label>
+      <input id="f-server_ip" name="server_ip" required placeholder="192.168.1.100">
+
+      <label for="f-server_port">server_port</label>
+      <input id="f-server_port" name="server_port" type="number" value="5060">
+
+      <label for="f-server_id">server_id *</label>
+      <input id="f-server_id" name="server_id" required
+             placeholder="11009000000000000000">
+
+      <label for="f-domain">domain</label>
+      <input id="f-domain" name="domain" placeholder="1100900000">
+
+      <label for="f-agent_id">agent_id *</label>
+      <input id="f-agent_id" name="agent_id" required
+             placeholder="300000000010000000001">
+
+      <label for="f-agent_password">agent_password *</label>
+      <div class="pw-wrap">
+        <input id="f-agent_password" name="agent_password" type="password" required>
+        <button type="button" class="toggle" onclick="togglePw('f-agent_password', this)">show</button>
+      </div>
+
+      <label for="f-source">source *</label>
+      <input id="f-source" name="source" required
+             placeholder="rtsp://user:pass@192.168.1.122/h264/ch1/main/av_stream">
+
+      <label for="f-udp">udp</label>
+      <select id="f-udp" name="udp">
+        <option value="false">false</option><option value="true">true</option>
+      </select>
+
+      <label for="f-local_ip">local_ip</label>
+      <input id="f-local_ip" name="local_ip" placeholder="(auto)">
+
+      <label for="f-manufacturer">manufacturer</label>
+      <input id="f-manufacturer" name="manufacturer" value="StrawberryInno">
+
+      <label for="f-devicename">devicename</label>
+      <input id="f-devicename" name="devicename" value="Superdock">
+
+      <label for="f-verbose">verbose</label>
+      <select id="f-verbose" name="verbose">
+        <option value="false">false</option><option value="true">true</option>
+      </select>
+
+      <label for="f-reconnect_interval">reconnect_interval</label>
+      <input id="f-reconnect_interval" name="reconnect_interval" type="number" value="5">
+
+      <label for="f-max_reconnect_attempts">max_reconnect_attempts</label>
+      <input id="f-max_reconnect_attempts" name="max_reconnect_attempts" type="number" value="0">
+
+      <label for="f-connection_timeout">connection_timeout</label>
+      <input id="f-connection_timeout" name="connection_timeout" type="number" value="10">
+
+      <label for="f-rtsp_precheck">rtsp_precheck</label>
+      <select id="f-rtsp_precheck" name="rtsp_precheck">
+        <option value="true">true</option><option value="false">false</option>
+      </select>
+
+      <label for="f-rtsp_precheck_timeout">rtsp_precheck_timeout</label>
+      <input id="f-rtsp_precheck_timeout" name="rtsp_precheck_timeout" type="number" value="5">
+
+      <label></label>
+      <div id="formErr" class="err"></div>
+
+      <label></label>
+      <div class="row-buttons">
+        <button type="button" onclick="closeModal()">Cancel</button>
+        <button type="submit" class="primary" id="submitBtn">Save</button>
+      </div>
+    </form>
+  </div>
+</div>
+
 <script>
-let instances = [];
+let channels = [];
+let editingCid = null;  // null == adding a new channel
 
 async function fetchStatus() {
-  const r = await fetch('/api/status');
-  instances = await r.json();
-  render();
+  try {
+    const r = await fetch('/api/channels');
+    const j = await r.json();
+    channels = j.channels || [];
+    render();
+  } catch (e) { toast('Failed to load: ' + e, true); }
 }
 
 function render() {
-  const total = instances.length;
-  const ok = instances.filter(i => i.registered && i.thread_alive).length;
+  const total = channels.length;
+  const ok = channels.filter(c => c.registered && c.thread_alive).length;
   const bad = total - ok;
   document.getElementById('stats').innerHTML =
-    `<b>${total}</b> instances · <b style="color:#6ee79c">${ok}</b> registered · ` +
+    `<b>${total}</b> channels · <b style="color:#6ee79c">${ok}</b> registered · ` +
     `<b style="color:${bad ? '#f08080' : '#8a99ad'}">${bad}</b> unhealthy · ` +
     `auto-refresh 5s`;
 
   const c = document.getElementById('container');
-  if (!total) { c.innerHTML = '<div class="empty">No instances running.</div>'; return; }
+  if (!total) { c.innerHTML = '<div class="empty">No channels configured. Click "+ Add Channel" to create one.</div>'; return; }
   c.className = 'grid';
-  c.innerHTML = instances.map(i => {
-    const state = !i.thread_alive ? 'err'
-                : i.registered ? 'ok' : 'warn';
-    const stateText = !i.thread_alive ? 'dead'
-                    : i.registered ? 'registered' : 'unregistered';
+  c.innerHTML = channels.map(ch => {
+    const state = !ch.thread_alive ? 'err'
+                : ch.registered ? 'ok' : 'warn';
+    const stateText = !ch.thread_alive ? 'dead'
+                    : ch.registered ? 'registered' : 'unregistered';
     return `
       <div class="card">
         <div class="row">
-          <div class="name">${esc(i.instance_name)}</div>
+          <div class="name">${esc(ch.instance_name)}</div>
           <span class="badge ${state}">${stateText}</span>
         </div>
         <div class="meta">
-          <div><b>channel_id</b> <code>${esc(i.channel_id)}</code></div>
-          <div><b>server</b> ${esc(i.server_ip)} (id ${esc(i.server_id)})</div>
-          <div><b>agent_id</b> <code>${esc(i.agent_id)}</code></div>
-          <div><b>source</b> <code>${esc(i.source)}</code></div>
-          <div><b>thread</b> ${i.thread_alive ? 'alive' : 'dead'}</div>
+          <div><b>file</b> <code>${esc(ch.config_file || '(missing)')}</code></div>
+          <div><b>channel_id</b> <code>${esc(ch.channel_id)}</code></div>
+          <div><b>server</b> ${esc(ch.server_ip)} (id ${esc(ch.server_id)})</div>
+          <div><b>agent_id</b> <code>${esc(ch.agent_id)}</code></div>
+          <div><b>source</b> <code>${esc(ch.source)}</code></div>
+          <div><b>thread</b> ${ch.thread_alive ? 'alive' : 'dead'}</div>
         </div>
         <div class="row actions-row">
-          <button onclick="restart('${esc(i.channel_id)}')">↻ Restart</button>
+          <button onclick="restart('${esc(ch.channel_id)}')">↻ Restart</button>
+          <button onclick="openEdit('${esc(ch.channel_id)}')">✎ Edit</button>
+          <button class="danger" onclick="del('${esc(ch.channel_id)}', '${esc(ch.instance_name)}')">✕ Delete</button>
         </div>
       </div>`;
   }).join('');
@@ -1310,6 +1747,12 @@ function toast(msg, err) {
   setTimeout(() => t.className = 'toast', 2500);
 }
 
+function togglePw(id, btn) {
+  const el = document.getElementById(id);
+  if (el.type === 'password') { el.type = 'text'; btn.textContent = 'hide'; }
+  else { el.type = 'password'; btn.textContent = 'show'; }
+}
+
 async function reloadAll() {
   const r = await fetch('/api/reload', {method: 'POST'});
   const j = await r.json();
@@ -1318,11 +1761,105 @@ async function reloadAll() {
   fetchStatus();
 }
 
-async function restart(channelId) {
-  if (!confirm(`Restart instance ${channelId}?`)) return;
-  const r = await fetch('/api/restart/' + encodeURIComponent(channelId), {method: 'POST'});
+async function restart(cid) {
+  if (!confirm(`Restart ${cid}?`)) return;
+  const r = await fetch('/api/restart/' + encodeURIComponent(cid), {method: 'POST'});
   const j = await r.json();
   toast(j.ok ? 'Restarted' : 'Failed: ' + (j.error || 'unknown'), !j.ok);
+  fetchStatus();
+}
+
+function openAdd() {
+  editingCid = null;
+  document.getElementById('modalTitle').textContent = 'Add Channel';
+  const f = document.getElementById('chForm');
+  f.reset();
+  // Sensible defaults
+  document.getElementById('f-udp').value = 'false';
+  document.getElementById('f-verbose').value = 'false';
+  document.getElementById('f-rtsp_precheck').value = 'true';
+  document.getElementById('f-config_file').disabled = false;
+  document.getElementById('f-config_file').readOnly = false;
+  document.getElementById('f-config_file').required = true;
+  document.getElementById('formErr').textContent = '';
+  document.getElementById('submitBtn').textContent = 'Create';
+  document.getElementById('modal').classList.add('show');
+  document.getElementById('f-config_file').focus();
+}
+
+async function openEdit(cid) {
+  const r = await fetch('/api/channels/' + encodeURIComponent(cid));
+  if (!r.ok) { toast('Failed to load channel: ' + r.status, true); return; }
+  const j = await r.json();
+  const cfg = j.config || {};
+  editingCid = cid;
+  document.getElementById('modalTitle').textContent = 'Edit ' + cid;
+  const set = (id, v) => { const el = document.getElementById(id); el.value = v ?? ''; };
+  set('f-config_file', j.config_file);
+  set('f-channel_id', cfg.channel_id);
+  set('f-server_ip', cfg.server_ip);
+  set('f-server_port', cfg.server_port);
+  set('f-server_id', cfg.server_id);
+  set('f-domain', cfg.domain);
+  set('f-agent_id', cfg.agent_id);
+  set('f-agent_password', cfg.agent_password);
+  set('f-source', cfg.source);
+  set('f-udp', String(cfg.udp));
+  set('f-local_ip', cfg.local_ip);
+  set('f-manufacturer', cfg.manufacturer);
+  set('f-devicename', cfg.devicename);
+  set('f-verbose', String(cfg.verbose));
+  set('f-reconnect_interval', cfg.reconnect_interval);
+  set('f-max_reconnect_attempts', cfg.max_reconnect_attempts);
+  set('f-connection_timeout', cfg.connection_timeout);
+  set('f-rtsp_precheck', String(cfg.rtsp_precheck));
+  set('f-rtsp_precheck_timeout', cfg.rtsp_precheck_timeout);
+  // config_file is read-only on edit (cannot rename the file in-place).
+  const cf = document.getElementById('f-config_file');
+  cf.readOnly = true;
+  cf.required = false;
+  document.getElementById('formErr').textContent = '';
+  document.getElementById('submitBtn').textContent = 'Save';
+  document.getElementById('modal').classList.add('show');
+}
+
+function closeModal() {
+  document.getElementById('modal').classList.remove('show');
+  editingCid = null;
+}
+
+async function submitForm(ev) {
+  ev.preventDefault();
+  const f = document.getElementById('chForm');
+  const body = new URLSearchParams(new FormData(f));
+  document.getElementById('formErr').textContent = '';
+  document.getElementById('submitBtn').disabled = true;
+  try {
+    let url, method;
+    if (editingCid) { url = '/api/channels/' + encodeURIComponent(editingCid); method = 'PUT'; }
+    else { url = '/api/channels'; method = 'POST'; }
+    const r = await fetch(url, { method, body });
+    const j = await r.json();
+    if (!r.ok || !j.ok) {
+      document.getElementById('formErr').textContent = j.error || ('HTTP ' + r.status);
+      return;
+    }
+    toast(editingCid ? 'Channel updated' : 'Channel created');
+    closeModal();
+    fetchStatus();
+  } catch (e) {
+    document.getElementById('formErr').textContent = String(e);
+  } finally {
+    document.getElementById('submitBtn').disabled = false;
+  }
+}
+
+async function del(cid, name) {
+  if (!confirm(`Delete channel ${name} (${cid})? This stops the pusher and removes config/${name}.json. This cannot be undone.`)) return;
+  const r = await fetch('/api/channels/' + encodeURIComponent(cid), {method: 'DELETE'});
+  const j = await r.json();
+  if (!r.ok || !j.ok) { toast('Delete failed: ' + (j.error || r.status), true); return; }
+  toast('Deleted ' + name);
   fetchStatus();
 }
 
@@ -1361,17 +1898,71 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    # ------------------------------------------------------------------
+    # Form / JSON body helpers
+    # ------------------------------------------------------------------
+    def _read_form(self) -> Dict[str, str]:
+        """Decode an ``application/x-www-form-urlencoded`` body into a flat dict.
+
+        Repeated keys are collapsed to the last value, which is fine for the
+        CRUD form where every field appears once.  Empty / missing body
+        returns an empty dict.
+        """
+        length = int(self.headers.get("Content-Length", 0) or 0)
+        if length <= 0:
+            return {}
+        raw = self.rfile.read(length)
+        try:
+            parsed = parse_qs(raw.decode("utf-8"), keep_blank_values=True)
+        except UnicodeDecodeError:
+            return {}
+        # Collapse: last value wins for each key.
+        return {k: v[-1] for k, v in parsed.items()}
+
+    # ------------------------------------------------------------------
+    # Route dispatch
+    # ------------------------------------------------------------------
     def do_GET(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             self._send_html(_WEB_INDEX_HTML)
-        elif path == "/api/status":
+            return
+        if path == "/api/status":
             try:
                 self._send_json(self.manager.get_status())
             except Exception as e:
                 self._send_json({"error": str(e)}, 500)
-        else:
-            self.send_error(404, "Not Found")
+            return
+        if path == "/api/channels":
+            try:
+                # Reuse get_status() output but enrich with config_file for the UI.
+                items = []
+                for s in self.manager.get_status():
+                    cid = s["channel_id"]
+                    info = self.manager.get_channel(cid)
+                    s["config_file"] = info["config_file"] if info else None
+                    s["has_config"] = info is not None
+                    items.append(s)
+                self._send_json({"channels": items})
+            except Exception as e:
+                self._send_json({"error": str(e)}, 500)
+            return
+        if path.startswith("/api/channels/"):
+            cid = path[len("/api/channels/"):]
+            if not cid:
+                self._send_json({"ok": False, "error": "missing channel_id"}, 400)
+                return
+            try:
+                info = self.manager.get_channel(cid)
+            except Exception as e:
+                self._send_json({"ok": False, "error": str(e)}, 500)
+                return
+            if info is None:
+                self._send_json({"ok": False, "error": "channel_id not found"}, 404)
+                return
+            self._send_json({"ok": True, **info})
+            return
+        self.send_error(404, "Not Found")
 
     def do_POST(self) -> None:  # noqa: N802
         path = self.path.split("?", 1)[0]
@@ -1382,7 +1973,8 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
             except Exception as e:
                 self._send_json({"added": [], "updated": [], "removed": [],
                                  "errors": [str(e)]}, 500)
-        elif path.startswith("/api/restart/"):
+            return
+        if path.startswith("/api/restart/"):
             cid = path[len("/api/restart/"):]
             if not cid:
                 self._send_json({"ok": False, "error": "missing channel_id"}, 400)
@@ -1395,8 +1987,88 @@ class _WebHandler(http.server.BaseHTTPRequestHandler):
                     self._send_json({"ok": False, "error": "channel_id not found"}, 404)
             except Exception as e:
                 self._send_json({"ok": False, "error": str(e)}, 500)
-        else:
+            return
+        if path == "/api/channels":
+            self._handle_create_channel()
+            return
+        self.send_error(404, "Not Found")
+
+    def do_PUT(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/api/channels/"):
             self.send_error(404, "Not Found")
+            return
+        cid = path[len("/api/channels/"):]
+        if not cid:
+            self._send_json({"ok": False, "error": "missing channel_id"}, 400)
+            return
+        self._handle_update_channel(cid)
+
+    def do_DELETE(self) -> None:  # noqa: N802
+        path = self.path.split("?", 1)[0]
+        if not path.startswith("/api/channels/"):
+            self.send_error(404, "Not Found")
+            return
+        cid = path[len("/api/channels/"):]
+        if not cid:
+            self._send_json({"ok": False, "error": "missing channel_id"}, 400)
+            return
+        try:
+            result = self.manager.delete_channel(cid)
+            self._send_json({"ok": True, **result})
+        except KeyError as e:
+            self._send_json({"ok": False, "error": str(e)}, 404)
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)}, 500)
+
+    # ------------------------------------------------------------------
+    # POST /api/channels — create new channel
+    # ------------------------------------------------------------------
+    def _handle_create_channel(self) -> None:
+        form = self._read_form()
+        config_file = (form.get("config_file") or "").strip()
+        if not config_file:
+            self._send_json(
+                {"ok": False, "error": "Missing config_file"}, 400)
+            return
+        try:
+            config = _build_config_from_form(form)
+        except ValueError as e:
+            self._send_json({"ok": False, "error": str(e)}, 400)
+            return
+        try:
+            result = self.manager.add_channel(config, config_file)
+        except FileExistsError as e:
+            self._send_json({"ok": False, "error": str(e)}, 409)
+        except ValueError as e:
+            self._send_json({"ok": False, "error": str(e)}, 400)
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)}, 500)
+        else:
+            self._send_json({"ok": True, **result})
+
+    # ------------------------------------------------------------------
+    # PUT /api/channels/<cid> — full-replace an existing channel
+    # ------------------------------------------------------------------
+    def _handle_update_channel(self, channel_id: str) -> None:
+        form = self._read_form()
+        # Drop config_file if present — cannot be changed on update.
+        form.pop("config_file", None)
+        try:
+            config = _build_config_from_form(form)
+        except ValueError as e:
+            self._send_json({"ok": False, "error": str(e)}, 400)
+            return
+        try:
+            result = self.manager.update_channel(channel_id, config)
+        except KeyError as e:
+            self._send_json({"ok": False, "error": str(e)}, 404)
+        except ValueError as e:
+            self._send_json({"ok": False, "error": str(e)}, 400)
+        except Exception as e:
+            self._send_json({"ok": False, "error": str(e)}, 500)
+        else:
+            self._send_json({"ok": True, **result})
 
 
 class WebAdminServer:
@@ -1518,7 +2190,7 @@ if __name__ == "__main__":
     )
     ap.add_argument(
         "--web-host",
-        default="127.0.0.1",
+        default="0.0.0.0",
         help="Web 管理界面绑定地址 (默认: 127.0.0.1，设为 0.0.0.0 允许外部访问)"
     )
     ap.add_argument(
