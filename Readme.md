@@ -40,32 +40,26 @@
 * **GStreamer ≥ 1.18**
 * 自编译的 `gb28181sink` 插件(本仓库 `gst-gb28181sink/` 目录下提供)
 
-### 安装 GStreamer 及编译依赖
+### 一键安装 + 编译(推荐)
+
+仓库自带脚本 [`Tools/install_and_build.sh`](Tools/install_and_build.sh),5 步走完:
 
 ```bash
-sudo apt update
-sudo apt install -y gstreamer1.0-tools gstreamer1.0-plugins-base \
-  gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
-sudo apt install -y meson ninja-build libgstreamer1.0-dev \
-  libgstreamer-plugins-base1.0-dev libglib2.0-dev
+./Tools/install_and_build.sh            # 装 apt 依赖 + 编译 + 用户级安装
+sudo ./Tools/install_and_build.sh --system   # 装到系统插件目录
+./Tools/install_and_build.sh --no-install --skip-apt   # CI / 已有环境:只编译
+./Tools/install_and_build.sh --help    # 全部参数
 ```
 
-### 编译 gb28181sink 插件
+脚本会自动:
+1. 检测 OS / 架构 / Python / GStreamer 环境
+2. `apt install` 编译 + 运行时依赖(gstreamer-dev / meson / ninja / x264 / libav 等)
+3. 检查 Python 标准库依赖(本项目无 pip 依赖)
+4. `meson setup` + `ninja` 编译 `gb28181sink`
+5. 安装到 `~/.local/lib/gstreamer-1.0`(默认)或 `/usr/local/lib/<arch>/gstreamer-1.0`(`--system`)
+6. 跑 `gst-inspect-1.0 gb28181sink` 验证
 
-```bash
-cd gst-gb28181sink
-meson setup build
-meson compile -C build
-
-# 安装到系统插件目录(默认 /usr/local/lib/<arch>/gstreamer-1.0)
-sudo meson install -C build
-
-# 或者保持用户目录编译结果,设置环境变量即可:
-# export GST_PLUGIN_PATH=$PWD/build
-
-# 验证插件已注册
-gst-inspect-1.0 gb28181sink
-```
+> 💡 想手动编译,见 `gst-gb28181/README.md` 里的 `meson setup build && meson compile -C build`。
 
 ### 本地环回测试
 
