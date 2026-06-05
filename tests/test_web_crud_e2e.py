@@ -136,7 +136,7 @@ def main():
     # 8) HTML page renders
     code, body = http("GET", f"{base}/", expect_json=False)
     print(f"[8] GET / -> {code}, html len={len(body)}")
-    assert code == 200 and "Add Channel" in body
+    assert code == 200 and "新增通道" in body
 
     print("\n*** ALL E2E ASSERTIONS PASSED ***")
 

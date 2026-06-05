@@ -1506,14 +1506,16 @@ class MultiPusherManager:
 ###############################################################################
 
 _WEB_INDEX_HTML = """<!DOCTYPE html>
-<html lang="en">
+<html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>sbgb28181 Admin</title>
+<title>sbgb28181 管理后台</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
-  body { margin: 0; font: 14px/1.4 -apple-system, "Segoe UI", system-ui, sans-serif;
+  body { margin: 0; font: 14px/1.5 -apple-system, BlinkMacSystemFont, "PingFang SC",
+         "Hiragino Sans GB", "Microsoft YaHei", "微软雅黑", "Segoe UI",
+         system-ui, sans-serif;
          background: #0e1419; color: #d6dde3; }
   header { padding: 14px 20px; background: #131c25; border-bottom: 1px solid #1f2a36;
            display: flex; align-items: center; gap: 16px; }
@@ -1522,7 +1524,8 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
   header .stats b { color: #d6dde3; }
   .actions { margin-left: auto; display: flex; gap: 8px; }
   button { background: #1d2a38; color: #d6dde3; border: 1px solid #2a3a4d;
-           padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px; }
+           padding: 6px 12px; border-radius: 4px; cursor: pointer; font-size: 13px;
+           font-family: inherit; }
   button:hover { background: #243446; }
   button.primary { background: #1f4f7a; border-color: #2974ad; }
   button.primary:hover { background: #255d8e; }
@@ -1537,7 +1540,7 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
                margin-bottom: 6px; }
   .card .name { font-weight: 600; color: #e0e6ed; word-break: break-all; }
   .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
-           font-size: 11px; font-weight: 600; text-transform: uppercase; }
+           font-size: 11px; font-weight: 600; }
   .badge.ok { background: #0f3d24; color: #6ee79c; }
   .badge.warn { background: #4a3a0e; color: #f0c060; }
   .badge.err { background: #4a1010; color: #f08080; }
@@ -1552,9 +1555,10 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
            opacity: 0; transition: opacity .3s; z-index: 100; }
   .toast.show { opacity: 1; }
   .toast.err { border-color: #8a2929; }
-  code { background: #0a0f15; padding: 1px 5px; border-radius: 3px; font-size: 12px; }
+  code { background: #0a0f15; padding: 1px 5px; border-radius: 3px; font-size: 12px;
+         font-family: "SF Mono", Menlo, Consolas, "微软雅黑", monospace; }
 
-  /* Modal */
+  /* 弹窗 */
   .modal-bg { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.6);
               align-items: center; justify-content: center; z-index: 50; }
   .modal-bg.show { display: flex; }
@@ -1582,94 +1586,94 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>sbgb28181 Admin</h1>
-  <div class="stats" id="stats">loading…</div>
+  <h1>sbgb28181 推流管理</h1>
+  <div class="stats" id="stats">加载中…</div>
   <div class="actions">
-    <button class="primary" onclick="openAdd()">+ Add Channel</button>
-    <button onclick="reloadAll()">↻ Reload Config</button>
+    <button class="primary" onclick="openAdd()">+ 新增通道</button>
+    <button onclick="reloadAll()">↻ 重载配置</button>
   </div>
 </header>
 <main>
-  <div id="container"><div class="empty">Loading…</div></div>
+  <div id="container"><div class="empty">加载中…</div></div>
 </main>
 <div class="toast" id="toast"></div>
 
-<!-- Channel add/edit modal -->
+<!-- 通道新增/编辑 弹窗 -->
 <div class="modal-bg" id="modal">
   <div class="modal">
-    <h2 id="modalTitle">Add Channel</h2>
+    <h2 id="modalTitle">新增通道</h2>
     <form id="chForm" class="grid-form" onsubmit="return submitForm(event)">
-      <label for="f-config_file">config_file *</label>
+      <label for="f-config_file">配置文件名 *</label>
       <input id="f-config_file" name="config_file" required pattern="[A-Za-z0-9_\\-]+\\.json"
              placeholder="camera_lobby.json">
       <label></label>
-      <div class="small">File name under <code>config/</code> (one JSON per channel).</div>
+      <div class="small">保存到 <code>config/</code> 目录下,每个通道一个 JSON 文件。</div>
 
-      <label for="f-channel_id">channel_id *</label>
+      <label for="f-channel_id">通道 ID *</label>
       <input id="f-channel_id" name="channel_id" required
              placeholder="340000000000000000001">
 
-      <label for="f-server_ip">server_ip *</label>
+      <label for="f-server_ip">国标服务器 IP *</label>
       <input id="f-server_ip" name="server_ip" required placeholder="192.168.1.100">
 
-      <label for="f-server_port">server_port</label>
+      <label for="f-server_port">服务器端口</label>
       <input id="f-server_port" name="server_port" type="number" value="5060">
 
-      <label for="f-server_id">server_id *</label>
+      <label for="f-server_id">服务器 ID *</label>
       <input id="f-server_id" name="server_id" required
              placeholder="11009000000000000000">
 
-      <label for="f-domain">domain</label>
+      <label for="f-domain">域</label>
       <input id="f-domain" name="domain" placeholder="1100900000">
 
-      <label for="f-agent_id">agent_id *</label>
+      <label for="f-agent_id">设备 ID *</label>
       <input id="f-agent_id" name="agent_id" required
              placeholder="300000000010000000001">
 
-      <label for="f-agent_password">agent_password *</label>
+      <label for="f-agent_password">设备密码 *</label>
       <div class="pw-wrap">
         <input id="f-agent_password" name="agent_password" type="password" required>
-        <button type="button" class="toggle" onclick="togglePw('f-agent_password', this)">show</button>
+        <button type="button" class="toggle" onclick="togglePw('f-agent_password', this)">显示</button>
       </div>
 
-      <label for="f-source">source *</label>
+      <label for="f-source">RTSP 源 *</label>
       <input id="f-source" name="source" required
-             placeholder="rtsp://user:pass@192.168.1.122/h264/ch1/main/av_stream">
+             placeholder="rtsp://用户名:密码@192.168.1.122/h264/ch1/main/av_stream">
 
-      <label for="f-udp">udp</label>
+      <label for="f-udp">UDP 信令</label>
       <select id="f-udp" name="udp">
-        <option value="false">false</option><option value="true">true</option>
+        <option value="false">关闭 (TCP)</option><option value="true">启用 (UDP)</option>
       </select>
 
-      <label for="f-local_ip">local_ip</label>
-      <input id="f-local_ip" name="local_ip" placeholder="(auto)">
+      <label for="f-local_ip">本机 IP</label>
+      <input id="f-local_ip" name="local_ip" placeholder="(自动检测)">
 
-      <label for="f-manufacturer">manufacturer</label>
+      <label for="f-manufacturer">厂商</label>
       <input id="f-manufacturer" name="manufacturer" value="StrawberryInno">
 
-      <label for="f-devicename">devicename</label>
+      <label for="f-devicename">设备名</label>
       <input id="f-devicename" name="devicename" value="Superdock">
 
-      <label for="f-verbose">verbose</label>
+      <label for="f-verbose">详细日志</label>
       <select id="f-verbose" name="verbose">
-        <option value="false">false</option><option value="true">true</option>
+        <option value="false">关闭</option><option value="true">开启</option>
       </select>
 
-      <label for="f-reconnect_interval">reconnect_interval</label>
+      <label for="f-reconnect_interval">重连间隔 (秒)</label>
       <input id="f-reconnect_interval" name="reconnect_interval" type="number" value="5">
 
-      <label for="f-max_reconnect_attempts">max_reconnect_attempts</label>
+      <label for="f-max_reconnect_attempts">最大重连次数</label>
       <input id="f-max_reconnect_attempts" name="max_reconnect_attempts" type="number" value="0">
 
-      <label for="f-connection_timeout">connection_timeout</label>
+      <label for="f-connection_timeout">连接超时 (秒)</label>
       <input id="f-connection_timeout" name="connection_timeout" type="number" value="10">
 
-      <label for="f-rtsp_precheck">rtsp_precheck</label>
+      <label for="f-rtsp_precheck">RTSP 预检</label>
       <select id="f-rtsp_precheck" name="rtsp_precheck">
-        <option value="true">true</option><option value="false">false</option>
+        <option value="true">开启</option><option value="false">关闭</option>
       </select>
 
-      <label for="f-rtsp_precheck_timeout">rtsp_precheck_timeout</label>
+      <label for="f-rtsp_precheck_timeout">预检超时 (秒)</label>
       <input id="f-rtsp_precheck_timeout" name="rtsp_precheck_timeout" type="number" value="5">
 
       <label></label>
@@ -1677,8 +1681,8 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
 
       <label></label>
       <div class="row-buttons">
-        <button type="button" onclick="closeModal()">Cancel</button>
-        <button type="submit" class="primary" id="submitBtn">Save</button>
+        <button type="button" onclick="closeModal()">取消</button>
+        <button type="submit" class="primary" id="submitBtn">保存</button>
       </div>
     </form>
   </div>
@@ -1686,7 +1690,7 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
 
 <script>
 let channels = [];
-let editingCid = null;  // null == adding a new channel
+let editingCid = null;  // null 表示新增
 
 async function fetchStatus() {
   try {
@@ -1694,26 +1698,27 @@ async function fetchStatus() {
     const j = await r.json();
     channels = j.channels || [];
     render();
-  } catch (e) { toast('Failed to load: ' + e, true); }
+  } catch (e) { toast('加载失败: ' + e, true); }
 }
+
+const STATE_LABEL = { ok: '已注册', warn: '未注册', err: '已停止' };
 
 function render() {
   const total = channels.length;
   const ok = channels.filter(c => c.registered && c.thread_alive).length;
   const bad = total - ok;
   document.getElementById('stats').innerHTML =
-    `<b>${total}</b> channels · <b style="color:#6ee79c">${ok}</b> registered · ` +
-    `<b style="color:${bad ? '#f08080' : '#8a99ad'}">${bad}</b> unhealthy · ` +
-    `auto-refresh 5s`;
+    `共 <b>${total}</b> 个通道 · <b style="color:#6ee79c">${ok}</b> 已注册 · ` +
+    `<b style="color:${bad ? '#f08080' : '#8a99ad'}">${bad}</b> 异常 · ` +
+    `每 5 秒自动刷新`;
 
   const c = document.getElementById('container');
-  if (!total) { c.innerHTML = '<div class="empty">No channels configured. Click "+ Add Channel" to create one.</div>'; return; }
+  if (!total) { c.innerHTML = '<div class="empty">暂无通道。点击"+ 新增通道"开始添加。</div>'; return; }
   c.className = 'grid';
   c.innerHTML = channels.map(ch => {
     const state = !ch.thread_alive ? 'err'
                 : ch.registered ? 'ok' : 'warn';
-    const stateText = !ch.thread_alive ? 'dead'
-                    : ch.registered ? 'registered' : 'unregistered';
+    const stateText = STATE_LABEL[state];
     return `
       <div class="card">
         <div class="row">
@@ -1721,17 +1726,17 @@ function render() {
           <span class="badge ${state}">${stateText}</span>
         </div>
         <div class="meta">
-          <div><b>file</b> <code>${esc(ch.config_file || '(missing)')}</code></div>
-          <div><b>channel_id</b> <code>${esc(ch.channel_id)}</code></div>
-          <div><b>server</b> ${esc(ch.server_ip)} (id ${esc(ch.server_id)})</div>
-          <div><b>agent_id</b> <code>${esc(ch.agent_id)}</code></div>
-          <div><b>source</b> <code>${esc(ch.source)}</code></div>
-          <div><b>thread</b> ${ch.thread_alive ? 'alive' : 'dead'}</div>
+          <div><b>配置文件</b> <code>${esc(ch.config_file || '(缺失)')}</code></div>
+          <div><b>通道 ID</b> <code>${esc(ch.channel_id)}</code></div>
+          <div><b>国标服务器</b> ${esc(ch.server_ip)} (id ${esc(ch.server_id)})</div>
+          <div><b>设备 ID</b> <code>${esc(ch.agent_id)}</code></div>
+          <div><b>RTSP 源</b> <code>${esc(ch.source)}</code></div>
+          <div><b>运行状态</b> ${ch.thread_alive ? '运行中' : '已停止'}</div>
         </div>
         <div class="row actions-row">
-          <button onclick="restart('${esc(ch.channel_id)}')">↻ Restart</button>
-          <button onclick="openEdit('${esc(ch.channel_id)}')">✎ Edit</button>
-          <button class="danger" onclick="del('${esc(ch.channel_id)}', '${esc(ch.instance_name)}')">✕ Delete</button>
+          <button onclick="restart('${esc(ch.channel_id)}')">↻ 重启</button>
+          <button onclick="openEdit('${esc(ch.channel_id)}')">✎ 编辑</button>
+          <button class="danger" onclick="del('${esc(ch.channel_id)}', '${esc(ch.instance_name)}')">✕ 删除</button>
         </div>
       </div>`;
   }).join('');
@@ -1749,32 +1754,32 @@ function toast(msg, err) {
 
 function togglePw(id, btn) {
   const el = document.getElementById(id);
-  if (el.type === 'password') { el.type = 'text'; btn.textContent = 'hide'; }
-  else { el.type = 'password'; btn.textContent = 'show'; }
+  if (el.type === 'password') { el.type = 'text'; btn.textContent = '隐藏'; }
+  else { el.type = 'password'; btn.textContent = '显示'; }
 }
 
 async function reloadAll() {
   const r = await fetch('/api/reload', {method: 'POST'});
   const j = await r.json();
-  toast(`Reload: +${j.added.length} ~${j.updated.length} -${j.removed.length}` +
-        (j.errors.length ? ` (${j.errors.length} errors)` : ''), j.errors.length);
+  toast(`重载: 新增 ${j.added.length} · 更新 ${j.updated.length} · 删除 ${j.removed.length}` +
+        (j.errors.length ? ` (${j.errors.length} 个错误)` : ''), j.errors.length);
   fetchStatus();
 }
 
 async function restart(cid) {
-  if (!confirm(`Restart ${cid}?`)) return;
+  if (!confirm(`确定要重启通道 ${cid} 吗?`)) return;
   const r = await fetch('/api/restart/' + encodeURIComponent(cid), {method: 'POST'});
   const j = await r.json();
-  toast(j.ok ? 'Restarted' : 'Failed: ' + (j.error || 'unknown'), !j.ok);
+  toast(j.ok ? '重启成功' : '重启失败: ' + (j.error || '未知错误'), !j.ok);
   fetchStatus();
 }
 
 function openAdd() {
   editingCid = null;
-  document.getElementById('modalTitle').textContent = 'Add Channel';
+  document.getElementById('modalTitle').textContent = '新增通道';
   const f = document.getElementById('chForm');
   f.reset();
-  // Sensible defaults
+  // 默认值
   document.getElementById('f-udp').value = 'false';
   document.getElementById('f-verbose').value = 'false';
   document.getElementById('f-rtsp_precheck').value = 'true';
@@ -1782,18 +1787,18 @@ function openAdd() {
   document.getElementById('f-config_file').readOnly = false;
   document.getElementById('f-config_file').required = true;
   document.getElementById('formErr').textContent = '';
-  document.getElementById('submitBtn').textContent = 'Create';
+  document.getElementById('submitBtn').textContent = '创建';
   document.getElementById('modal').classList.add('show');
   document.getElementById('f-config_file').focus();
 }
 
 async function openEdit(cid) {
   const r = await fetch('/api/channels/' + encodeURIComponent(cid));
-  if (!r.ok) { toast('Failed to load channel: ' + r.status, true); return; }
+  if (!r.ok) { toast('加载通道失败: HTTP ' + r.status, true); return; }
   const j = await r.json();
   const cfg = j.config || {};
   editingCid = cid;
-  document.getElementById('modalTitle').textContent = 'Edit ' + cid;
+  document.getElementById('modalTitle').textContent = '编辑通道 ' + cid;
   const set = (id, v) => { const el = document.getElementById(id); el.value = v ?? ''; };
   set('f-config_file', j.config_file);
   set('f-channel_id', cfg.channel_id);
@@ -1814,12 +1819,12 @@ async function openEdit(cid) {
   set('f-connection_timeout', cfg.connection_timeout);
   set('f-rtsp_precheck', String(cfg.rtsp_precheck));
   set('f-rtsp_precheck_timeout', cfg.rtsp_precheck_timeout);
-  // config_file is read-only on edit (cannot rename the file in-place).
+  // 编辑模式下配置文件名只读 (不能就地改名)
   const cf = document.getElementById('f-config_file');
   cf.readOnly = true;
   cf.required = false;
   document.getElementById('formErr').textContent = '';
-  document.getElementById('submitBtn').textContent = 'Save';
+  document.getElementById('submitBtn').textContent = '保存';
   document.getElementById('modal').classList.add('show');
 }
 
@@ -1844,7 +1849,7 @@ async function submitForm(ev) {
       document.getElementById('formErr').textContent = j.error || ('HTTP ' + r.status);
       return;
     }
-    toast(editingCid ? 'Channel updated' : 'Channel created');
+    toast(editingCid ? '通道已更新' : '通道已创建');
     closeModal();
     fetchStatus();
   } catch (e) {
@@ -1855,11 +1860,11 @@ async function submitForm(ev) {
 }
 
 async function del(cid, name) {
-  if (!confirm(`Delete channel ${name} (${cid})? This stops the pusher and removes config/${name}.json. This cannot be undone.`)) return;
+  if (!confirm(`确定要删除通道 ${name} (${cid}) 吗?\n\n这将停止推流进程并删除 config/${name}.json 文件,操作不可撤销!`)) return;
   const r = await fetch('/api/channels/' + encodeURIComponent(cid), {method: 'DELETE'});
   const j = await r.json();
-  if (!r.ok || !j.ok) { toast('Delete failed: ' + (j.error || r.status), true); return; }
-  toast('Deleted ' + name);
+  if (!r.ok || !j.ok) { toast('删除失败: ' + (j.error || r.status), true); return; }
+  toast('已删除 ' + name);
   fetchStatus();
 }
 
