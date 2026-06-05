@@ -1,4 +1,4 @@
-"""Unit tests for the web CRUD upgrade of sbgb28181 admin UI.
+"""Unit tests for the web CRUD upgrade of skygb28181 admin UI.
 
 Covers:
 1. GET  /api/channels        — list of all instances + config_file
@@ -72,7 +72,7 @@ class _WebCrdTestBase(unittest.TestCase):
 
     def setUp(self) -> None:
         # Each test gets its own temp config dir.
-        self._tmp = tempfile.mkdtemp(prefix="sbgb28181-test-")
+        self._tmp = tempfile.mkdtemp(prefix="skygb28181-test-")
         self._port = _free_port()
         # A minimal config that pretends to have one running instance.
         cid = "340000000000000000001"

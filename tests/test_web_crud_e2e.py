@@ -74,7 +74,7 @@ def make_manager(config_dir):
 
 
 def main():
-    tmp = tempfile.mkdtemp(prefix="sbgb28181-e2e-")
+    tmp = tempfile.mkdtemp(prefix="skygb28181-e2e-")
     port = free_port()
     mgr, fname = make_manager(tmp)
     web = g.WebAdminServer(mgr, "127.0.0.1", port)

@@ -554,7 +554,7 @@ class GB28181Pusher(AbstractContextManager):
             f"CSeq: {cseq} REGISTER",
             f"Contact: <sip:{self.agent_id}@{self.local_ip}:{self._local_port}>;+sip.instance=\"<urn:uuid:{self.agent_id}>\"",
             "Max-Forwards: 70",
-            "User-Agent: sbgb28181",
+            "User-Agent: skygb28181",
             "Expires: 3600",
         ]
         if auth_header:
@@ -570,7 +570,7 @@ class GB28181Pusher(AbstractContextManager):
             f"CSeq: {cseq} MESSAGE",
             "Content-Type: Application/MANSCDP+xml",
             "Max-Forwards: 70",
-            "User-Agent: sbgb28181",
+            "User-Agent: skygb28181",
         ]
         return self._sip(f"MESSAGE sip:{self.server_id}@{self.domain} SIP/2.0", hdrs, xml_body)
 
@@ -587,7 +587,7 @@ class GB28181Pusher(AbstractContextManager):
             f"Call-ID:{call}",
             f"CSeq:{cseq}",
             f"Contact: <sip:{self.agent_id}@{self.local_ip}:{self._local_port}>",
-            "User-Agent: sbgb28181",
+            "User-Agent: skygb28181",
         ]
         return self._sip("SIP/2.0 200 OK", hdrs)
 
@@ -636,7 +636,7 @@ class GB28181Pusher(AbstractContextManager):
             f"CSeq:{cseq}",
             f"Contact: <sip:{self.agent_id}@{self.local_ip}:{self._local_port}>",
             "Content-Type: application/sdp",
-            "User-Agent: sbgb28181",
+            "User-Agent: skygb28181",
         ]
         return self._sip("SIP/2.0 200 OK", hdrs, sdp_body)
 
@@ -665,7 +665,7 @@ class GB28181Pusher(AbstractContextManager):
             "Expires: 600",
             "Content-Type: Application/MANSCDP+xml",
             f"Event: Catalog;id={ev_id}",
-            "User-Agent: sbgb28181",
+            "User-Agent: skygb28181",
         ]
         return self._sip("SIP/2.0 200 OK", hdrs, body)
 
@@ -1509,7 +1509,7 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
-<title>sbgb28181 管理后台</title>
+<title>skygb28181 管理后台</title>
 <style>
   :root { color-scheme: dark; }
   * { box-sizing: border-box; }
@@ -1586,7 +1586,7 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
 </head>
 <body>
 <header>
-  <h1>sbgb28181 推流管理</h1>
+  <h1>skygb28181 推流管理</h1>
   <div class="stats" id="stats">加载中…</div>
   <div class="actions">
     <button class="primary" onclick="openAdd()">+ 新增通道</button>

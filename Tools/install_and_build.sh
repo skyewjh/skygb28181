@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # ============================================================================
 #  install_and_build.sh — 一键安装编译环境并编译 gb28181sink 插件
-#  sbgb28181 项目的官方引导脚本
+#  skygb28181 项目的官方引导脚本
 #
 #  用法:
 #    ./Tools/install_and_build.sh                # 推荐默认 (用户级安装)
@@ -115,7 +115,7 @@ fi
 
 if [[ ! -d "$SINK_DIR" ]]; then
     err "找不到 gb28181sink 源码目录: $SINK_DIR"
-    err "请在 sbgb28181 仓库根目录下运行此脚本"
+    err "请在 skygb28181 仓库根目录下运行此脚本"
     exit 1
 fi
 if [[ ! -f "$SINK_DIR/meson.build" ]]; then
@@ -201,7 +201,7 @@ fi
 # Step 2: Python 依赖检查
 # ----------------------------------------------------------------------------
 log "Step 2/5  Python 依赖检查"
-log "  sbgb28181 是纯标准库实现, 不需要 pip install"
+log "  skygb28181 是纯标准库实现, 不需要 pip install"
 # 但顺便测一下我们用的库都在
 python3 -c 'import http.server, urllib.parse, hashlib, socket, threading, json, re, subprocess' \
     && ok "标准库导入正常 (http.server, urllib.parse, hashlib, socket, ...)" \
@@ -304,7 +304,7 @@ fi
 # ----------------------------------------------------------------------------
 echo
 ok "============================================"
-ok " ✓ sbgb28181 编译环境就绪, gb28181sink 已可用"
+ok " ✓ skygb28181 编译环境就绪, gb28181sink 已可用"
 ok "============================================"
 echo
 log "下一步:"

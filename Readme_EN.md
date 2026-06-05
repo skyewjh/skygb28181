@@ -1,4 +1,4 @@
-# sbgb28181 Pusher
+# skygb28181 Pusher
 
 [中文版](Readme.md)
 
@@ -33,10 +33,8 @@ This repository contains a lean **GB28181** reference implementation that turns 
 ### Install GStreamer & build deps
 
 ```bash
-sudo apt install -y gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good
-sudo apt install -y meson ninja-build \
-     libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
-     libglib2.0-dev
+sudo apt install -y gstreamer1.0-tools gstreamer1.0-plugins-base gstreamer1.0-plugins-good gstreamer1.0-plugins-bad
+sudo apt install -y meson ninja-build libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev libglib2.0-dev
 ```
 
 ### Build the `gb28181sink` plugin

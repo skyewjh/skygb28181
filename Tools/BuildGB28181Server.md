@@ -39,7 +39,7 @@ cd ~/ZLMediaKit/release/linux/Debug
 vim config.ini
 # 公网部署时,将http.allow_ip_range的值留空
 # 复制api.secret的值
-# 修改general.mediaServerId的值为sbgb28181test
+# 修改general.mediaServerId的值为skygb28181test
 ./MediaServer
 ```
 
@@ -131,7 +131,7 @@ cd ../../../target/
 vim all-application.yml
 #修改datasource.password为mysql的root密码
 #修改sip.ip填写0.0.0.0
-#修改media.id为sbgb28181test
+#修改media.id为skygb28181test
 #media.secret填写在zlm中复制的api.secret的值
 #media.ip和media.hook-ip填写服务器内网ip
 #media.stream-ip和media.sdp-ip填写服务器公网ip
