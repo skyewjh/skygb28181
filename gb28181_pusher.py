@@ -160,8 +160,8 @@ def load_config(config_path: str) -> Dict[str, Any]:
     
     # Set default values for optional parameters
     defaults = {
-        "server_port": 5060,
-        "domain": None,
+        "server_port": 8116,
+        "domain": "4101050000",
         "udp": False,
         "local_ip": None,
         "verbose": False,
@@ -169,7 +169,7 @@ def load_config(config_path: str) -> Dict[str, Any]:
         "max_reconnect_attempts": 0,
         "connection_timeout": 10,
         "source": "test",
-        "manufacturer": "StrawberryInno",
+        "manufacturer": "gzhaibaogd",
         "devicename": "Superdock",
         "rtsp_precheck": True,
         "rtsp_precheck_timeout": 5,
@@ -281,8 +281,8 @@ def _build_config_from_form(form: Dict[str, str]) -> Dict[str, Any]:
 
 # Same defaults used by load_config() — kept in sync.
 _CRUD_FIELD_DEFAULTS: Dict[str, Any] = {
-    "server_port": 5060,
-    "domain": None,
+    "server_port": 8116,
+    "domain": "4101050000",
     "udp": False,
     "local_ip": None,
     "verbose": False,
@@ -290,7 +290,7 @@ _CRUD_FIELD_DEFAULTS: Dict[str, Any] = {
     "max_reconnect_attempts": 0,
     "connection_timeout": 10,
     "source": "test",
-    "manufacturer": "StrawberryInno",
+    "manufacturer": "gzhaibaogd",
     "devicename": "Superdock",
     "rtsp_precheck": True,
     "rtsp_precheck_timeout": 5,
@@ -1614,25 +1614,24 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
              placeholder="340000000000000000001">
 
       <label for="f-server_ip">国标服务器 IP *</label>
-      <input id="f-server_ip" name="server_ip" required placeholder="192.168.1.100">
+      <input id="f-server_ip" name="server_ip" required value="101.226.23.126">
 
       <label for="f-server_port">服务器端口</label>
-      <input id="f-server_port" name="server_port" type="number" value="5060">
+      <input id="f-server_port" name="server_port" type="number" value="8116">
 
       <label for="f-server_id">服务器 ID *</label>
-      <input id="f-server_id" name="server_id" required
-             placeholder="11009000000000000000">
+      <input id="f-server_id" name="server_id" required value="41010500002000000001">
 
       <label for="f-domain">域</label>
-      <input id="f-domain" name="domain" placeholder="1100900000">
+      <input id="f-domain" name="domain" value="4101050000">
 
       <label for="f-agent_id">设备 ID *</label>
       <input id="f-agent_id" name="agent_id" required
-             placeholder="300000000010000000001">
+             placeholder="340000000000000000001">
 
       <label for="f-agent_password">设备密码 *</label>
       <div class="pw-wrap">
-        <input id="f-agent_password" name="agent_password" type="password" required>
+        <input id="f-agent_password" name="agent_password" type="password" required value="12345678">
         <button type="button" class="toggle" onclick="togglePw('f-agent_password', this)">显示</button>
       </div>
 
@@ -1649,7 +1648,7 @@ _WEB_INDEX_HTML = """<!DOCTYPE html>
       <input id="f-local_ip" name="local_ip" placeholder="(自动检测)">
 
       <label for="f-manufacturer">厂商</label>
-      <input id="f-manufacturer" name="manufacturer" value="StrawberryInno">
+      <input id="f-manufacturer" name="manufacturer" value="gzhaibaogd">
 
       <label for="f-devicename">设备名</label>
       <input id="f-devicename" name="devicename" value="Superdock">
