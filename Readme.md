@@ -265,12 +265,6 @@ python3 Tools/gb28181_proxy.py \
 
 ---
 
-## 🧑‍💻 辅助编程
-
-OpenAI o3 和 Gemini 2.5 Pro,以及 Anthropic MiniMax。
-
----
-
 ## 📜 许可
 
 本仓库采用 **MIT** 协议开源,详见 `LICENSE`(如未提供请补充)。
